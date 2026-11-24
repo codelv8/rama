@@ -29,6 +29,8 @@ const item = (array, id) => array.find((entry) => entry.id === id);
 const readStorage = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
 const storedSave = readStorage(SAVE_KEY);
 let state = loadGame(storedSave, Date.now());
+let startupVictory = false;
+try { startupVictory = Boolean(storedSave) && JSON.parse(storedSave)?.campaignWon !== true && state.campaignWon; } catch { /* Invalid saves already fall back to a new game. */ }
 let preferences;
 try { preferences = JSON.parse(readStorage(SETTINGS_KEY)) || {}; } catch { preferences = {}; }
 if (!preferences || typeof preferences !== 'object' || Array.isArray(preferences)) preferences = {};
@@ -41,6 +43,7 @@ let saveFailed = false;
 let night = Boolean(preferences.night);
 let modalCount = 1;
 let pendingRestore = null;
+let pendingRestoreVictory = false;
 const audio = createAudio();
 audio.setEnabled(Boolean(preferences.sound), false);
 let village;
@@ -207,6 +210,7 @@ function closeModal() {
   $('#game-dialog').close();
   modal = null;
   pendingRestore = null;
+  pendingRestoreVictory = false;
   village?.setSelected(null);
   world?.setSelected(null);
   (lastFocus?.isConnected ? lastFocus : $('.nav-item.active'))?.focus?.({ preventScroll: true });
@@ -276,12 +280,12 @@ function renderModal() {
 function expeditionDetails(preview, node) {
   return `<div class="battle-comparison"><div><small>พลังทัพของคุณ</small><b class="${preview.willWin ? 'positive' : 'negative'}">${number(preview.power)}</b></div><span>VS</span><div><small>พลังฝ่ายตรงข้าม</small><b>${node.threat}</b></div></div><div class="battle-outcome ${preview.willWin ? 'likely-win' : 'likely-loss'}">${icon(preview.willWin ? 'shield' : 'help')}<span>${preview.willWin ? 'กองทัพพร้อมสำหรับชัยชนะ' : 'พลังรบยังไม่พอ ควรเสริมกำลังก่อน'}<small>คาดว่าสูญเสีย ${preview.estimatedLosses} นาย · เสบียง ${preview.cost.rice} ข้าว</small></span></div><h3 class="small-heading">ทรัพยากรเมื่อชนะ</h3>${costs(preview.rewards, true)}<div class="duration-line">${icon('clock')} เดินทางและกลับเมือง <b>${duration(node.duration)}</b></div>`;
 }
-function updateCount(value) {
+function updateCount(value, { preserveInput = false } = {}) {
   const limit = modal?.type === 'train' ? 50 : Math.max(1, getArmySize(state));
   modalCount = Math.max(1, Math.min(limit, Math.floor(Number(value)) || 1));
   if (modal?.type === 'train') {
     const input = $('#troop-count');
-    if (input) input.value = modalCount;
+    if (input && (!preserveInput || document.activeElement !== input)) input.value = modalCount;
     const cost = getTrainingCost(state, modal.id, modalCount);
     $('#training-cost').innerHTML = costs(cost);
     $('#training-duration').textContent = duration(getTrainingDuration(state, modal.id, modalCount));
@@ -291,8 +295,9 @@ function updateCount(value) {
     $('#training-note').textContent = state.queues.training ? 'รอให้การฝึกปัจจุบันเสร็จก่อน' : !canAfford(state, cost) ? 'ทรัพยากรยังไม่พอสำหรับจำนวนนี้' : 'ทหารจะเข้าประจำการเมื่อการฝึกทั้งชุดเสร็จสิ้น';
     document.querySelectorAll('[data-action="set-count"]').forEach((button) => button.classList.toggle('selected', Number(button.dataset.count) === modalCount));
   } else if (modal?.type === 'expedition') {
-    $('#expedition-count').value = modalCount;
-    $('#expedition-range').value = modalCount;
+    for (const input of [$('#expedition-count'), $('#expedition-range')]) {
+      if (!preserveInput || document.activeElement !== input) input.value = modalCount;
+    }
     const preview = getExpeditionPreview(state, modal.id, modalCount);
     $('#expedition-preview').innerHTML = expeditionDetails(preview, item(WORLD_NODES, modal.id));
     $('#expedition-confirm').disabled = !preview.available;
@@ -322,7 +327,8 @@ function save() {
   lastSave = Date.now();
 }
 function perform(action, { close = false } = {}) {
-  advanceGame();
+  const wasWon = state.campaignWon;
+  advanceGame({ showVictory: false });
   const result = action();
   toast(result.message, result.ok ? 'success' : 'error');
   audio.play(result.ok ? 'success' : 'error');
@@ -333,8 +339,9 @@ function perform(action, { close = false } = {}) {
     if (modal) renderModal();
     lastEvent = state.eventSerial;
   }
+  if (!wasWon && state.campaignWon) openModal('victory');
 }
-function advanceGame() {
+function advanceGame({ showVictory = true } = {}) {
   const before = state.eventSerial;
   const wasWon = state.campaignWon;
   tick(state);
@@ -346,7 +353,7 @@ function advanceGame() {
     lastEvent = state.eventSerial;
     audio.play('success');
     if (modal) renderModal();
-    if (!wasWon && state.campaignWon) openModal('victory');
+    if (showVictory && !wasWon && state.campaignWon) openModal('victory');
     save();
   }
   return changed;
@@ -369,8 +376,13 @@ document.addEventListener('click', (event) => {
   else if (['building', 'hero', 'train', 'expedition'].includes(action)) openModal(action, id);
   else if (['settings', 'help', 'reports'].includes(action)) openModal(action);
   else if (action === 'upgrade') perform(() => upgradeBuilding(state, id));
-  else if (action === 'train-confirm') perform(() => trainTroops(state, id, modalCount), { close: true });
-  else if (action === 'expedition-confirm') perform(() => sendExpedition(state, id, modalCount), { close: true });
+  else if (action === 'train-confirm') {
+    const count = modalCount;
+    perform(() => trainTroops(state, id, count), { close: true });
+  } else if (action === 'expedition-confirm') {
+    const count = modalCount;
+    perform(() => sendExpedition(state, id, count), { close: true });
+  }
   else if (action === 'allocate') perform(() => allocateHeroPoint(state, id));
   else if (action === 'claim') perform(() => claimQuest(state, id));
   else if (action === 'quest-guide') questGuide(id);
@@ -417,6 +429,7 @@ document.addEventListener('click', (event) => {
     toast('ดาวน์โหลดไฟล์สำรองแล้ว');
   } else if (action === 'restore-pick') $('#restore-file').click();
   else if (action === 'restore-confirm' && pendingRestore) {
+    const showRestoredVictory = pendingRestoreVictory;
     state = pendingRestore;
     lastEvent = state.eventSerial;
     closeModal();
@@ -425,6 +438,7 @@ document.addEventListener('click', (event) => {
     refresh();
     save();
     toast('กู้คืนอาณาจักรจากไฟล์สำรองแล้ว');
+    if (showRestoredVictory) openModal('victory');
   } else if (action === 'reset-prompt') openModal('reset');
   else if (action === 'reset-confirm') {
     state = createGame();
@@ -450,6 +464,7 @@ $('#restore-file').addEventListener('change', async (event) => {
     const plainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
     if (!plainObject(data) || data.version !== 1 || !['resources', 'buildings', 'army', 'hero', 'queues', 'quests', 'stats'].every((key) => plainObject(data[key])) || !Number.isFinite(data.lastTick) || !RESOURCE_IDS.every((key) => Number.isFinite(data.resources[key])) || !BUILDINGS.every(({ id }) => Number.isFinite(data.buildings[id])) || !TROOPS.every(({ id }) => Number.isFinite(data.army[id]))) throw new Error('Invalid backup');
     pendingRestore = loadGame(data);
+    pendingRestoreVictory = data.campaignWon !== true && pendingRestore.campaignWon;
     openModal('restore');
   } catch { toast('ไฟล์นี้ไม่ใช่ไฟล์สำรอง RAMA ที่รองรับ', 'error'); }
 });
@@ -467,7 +482,11 @@ requestAnimationFrame(() => {
   village.setNight(night);
   world = createWorldMap($('#world-map'), { onSelect: (id) => openModal('expedition', id) });
   world.setState(state);
-  if (!storedSave) setTimeout(() => toast('ยินดีต้อนรับสู่อโยธยา! เริ่มจากอัปเกรดโรงเลื่อยเพื่อรับรางวัลภารกิจแรก', 'info'), 1400);
+  if (startupVictory) {
+    startupVictory = false;
+    openModal('victory');
+    save();
+  } else if (!storedSave) setTimeout(() => toast('ยินดีต้อนรับสู่อโยธยา! เริ่มจากอัปเกรดโรงเลื่อยเพื่อรับรางวัลภารกิจแรก', 'info'), 1400);
   else if (state.events.length) setTimeout(() => toast('ยินดีต้อนรับกลับ เมืองของคุณเติบโตต่อระหว่างที่คุณไม่อยู่', 'info'), 1200);
 });
 setInterval(() => {
@@ -483,7 +502,7 @@ setInterval(() => {
       const grid = $('#game-dialog .cost-grid');
       if (grid) grid.outerHTML = costs(cost);
     }
-  } else if (!changed && (modal?.type === 'train' || modal?.type === 'expedition') && !['troop-count', 'expedition-count', 'expedition-range'].includes(document.activeElement?.id)) updateCount(modalCount);
+  } else if (!changed && (modal?.type === 'train' || modal?.type === 'expedition')) updateCount(modalCount, { preserveInput: true });
   if (Date.now() - lastSave > 5000) save();
 }, 500);
 

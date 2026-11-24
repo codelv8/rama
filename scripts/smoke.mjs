@@ -13,7 +13,8 @@ const output = join(root, 'test-results');
 const port = Number(process.env.RAMA_SMOKE_PORT || 4178);
 assert(Number.isInteger(port) && port >= 1024 && port <= 65535, 'RAMA_SMOKE_PORT must be an integer from 1024 to 65535.');
 const origin = `http://127.0.0.1:${port}`;
-const report = { status: 'running', startedAt: new Date().toISOString(), viewports: { desktop: { width: 1440, height: 1000 }, mobile: { width: 390, height: 844 } }, steps: [], screenshots: [], errors: [] };
+const requiredScreenshots = ['desktop-city.png', 'desktop-heroes.png', 'desktop-world.png', 'desktop-night.png', 'mobile-city.png', 'mobile-building-dialog.png', 'mobile-expedition-dialog.png'];
+const report = { status: 'running', timing: 'real-time', startedAt: new Date().toISOString(), viewports: { desktop: { width: 1440, height: 1000 }, mobile: { width: 390, height: 844 } }, steps: [], queueWaits: [], screenshots: [], captureAttempts: [], errors: [] };
 let browser;
 let server;
 let desktop;
@@ -82,26 +83,37 @@ async function clearToasts(page) {
 }
 
 async function capture(page, filename) {
-  // Timed gameplay uses fastForward. Give the app two live frame callbacks
-  // after explicitly resuming before asking Chromium's compositor to capture.
-  // reducedMotion is already enabled on the context; screenshot animation
-  // cancellation is unnecessary and can interfere with clock-driven frames.
-  await page.clock.resume();
-  await clearToasts(page);
-  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  await page.screenshot({ path: join(output, filename), fullPage: true, timeout: 30_000 });
-  report.screenshots.push(filename);
+  // Screenshots are required evidence, but a transient compositor timeout must
+  // not prevent us from exercising the remaining gameplay. Retry once, retain
+  // the exact attempt outcomes, and enforce completeness in a separate final gate.
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const startedAt = Date.now();
+    try {
+      await page.bringToFront();
+      await clearToasts(page);
+      await page.screenshot({ path: join(output, filename), fullPage: false, timeout: 15_000 });
+      report.captureAttempts.push({ filename, attempt, status: 'passed', durationMs: Date.now() - startedAt });
+      report.screenshots.push(filename);
+      return true;
+    } catch (error) {
+      report.captureAttempts.push({ filename, attempt, status: 'failed', durationMs: Date.now() - startedAt, message: error.message });
+      console.warn(`CAPTURE ${filename} attempt ${attempt} failed: ${error.message.split('\n')[0]}`);
+    }
+  }
+  return false;
 }
 
-async function advanceQueue(page, queueName) {
+async function waitForQueue(page, queueName) {
   const before = await snapshot(page);
   const queue = before.queues[queueName];
   assert(queue, `${queueName} queue was not created by the UI.`);
   const remaining = await page.evaluate((endsAt) => Math.max(0, endsAt - Date.now()), queue.endsAt);
-  // The real application timer calls tick after browser time advances. No state
-  // mutations, engine calls, or fixture saves are used to complete the action.
-  await page.clock.fastForward(remaining + 1100);
-  await page.waitForFunction((name) => window.rama.getSnapshot().queues[name] === null, queueName, { timeout: 10_000 });
+  assert(remaining <= 50_000, `The smoke action unexpectedly needs ${remaining}ms; its real-time wait must stay bounded.`);
+  const startedAt = Date.now();
+  // Use the application's actual clock, interval and rendering lifecycle.
+  // No Date, timer or requestAnimationFrame implementation is replaced.
+  await page.waitForFunction((name) => window.rama.getSnapshot().queues[name] === null, queueName, { polling: 250, timeout: Math.ceil(remaining) + 10_000 });
+  report.queueWaits.push({ queue: queueName, expectedRemainingMs: Math.ceil(remaining), elapsedMs: Date.now() - startedAt });
 }
 
 async function closeDialog(page) {
@@ -131,7 +143,7 @@ async function train(page, id, count) {
   assert.equal(queued.queues.training?.count, count);
   assert.equal(queued.army[id], before.army[id], 'Soldiers must not be granted before training finishes.');
   assert(queued.resources.rice < before.resources.rice, 'Training should consume resources.');
-  await advanceQueue(page, 'training');
+  await waitForQueue(page, 'training');
   assert.equal((await snapshot(page)).army[id], before.army[id] + count, 'Trained soldiers were not added after the timer.');
 }
 
@@ -171,7 +183,6 @@ try {
     desktop = await context.newPage();
     desktop.setDefaultTimeout(15_000);
     observeErrors(desktop, 'desktop');
-    await desktop.clock.install({ time: new Date() });
     await desktop.goto(origin, { waitUntil: 'networkidle' });
     await ready(desktop);
     report.desktopDiagnostics = await desktop.evaluate(() => window.rama.getDiagnostics());
@@ -187,7 +198,7 @@ try {
     assert.equal(queued.queues.building?.buildingId, 'sawmill');
     assert.equal(queued.buildings.sawmill, before.buildings.sawmill, 'The upgrade must wait for its construction timer.');
     assert(queued.resources.wood < before.resources.wood, 'An upgrade should consume resources.');
-    await advanceQueue(desktop, 'building');
+    await waitForQueue(desktop, 'building');
     assert.equal((await snapshot(desktop)).buildings.sawmill, before.buildings.sawmill + 1);
     await desktop.keyboard.press('Escape');
     assert.equal(await desktop.locator('#game-dialog').evaluate((element) => element.open), false);
@@ -224,7 +235,7 @@ try {
     assert.equal(queued.queues.expedition?.nodeId, 'grove');
     assert(Object.values(queued.army).reduce((sum, count) => sum + count, 0) < Object.values(before.army).reduce((sum, count) => sum + count, 0), 'Deployed troops must leave the available army.');
     await desktop.waitForSelector('.world-march-marker');
-    await advanceQueue(desktop, 'expedition');
+    await waitForQueue(desktop, 'expedition');
     const after = await snapshot(desktop);
     assert(after.completedNodes.includes('grove'), 'Winning the grove must complete the destination.');
     assert.equal(after.stats.victories, before.stats.victories + 1);
@@ -302,12 +313,10 @@ try {
 
   await step('Render the saved city at 390 × 844 with touch controls', async () => {
     const storageState = await desktop.context().storageState();
-    const progress = await snapshot(desktop);
     const context = await browser.newContext({ viewport: report.viewports.mobile, deviceScaleFactor: 1, isMobile: true, hasTouch: true, reducedMotion: 'reduce', storageState });
     mobile = await context.newPage();
     mobile.setDefaultTimeout(15_000);
     observeErrors(mobile, 'mobile');
-    await mobile.clock.install({ time: new Date(progress.lastTick) });
     await mobile.goto(origin, { waitUntil: 'networkidle' });
     await ready(mobile);
     report.mobileDiagnostics = await mobile.evaluate(() => window.rama.getDiagnostics());
@@ -332,6 +341,11 @@ try {
     assert.deepEqual(report.errors, [], JSON.stringify(report.errors, null, 2));
   });
 
+  await step('All seven required screenshots were captured successfully', async () => {
+    const missing = requiredScreenshots.filter((filename) => !report.screenshots.includes(filename));
+    assert.deepEqual(missing, [], `Required visual evidence is missing: ${missing.join(', ')}. See captureAttempts for compositor errors.`);
+  });
+
   report.status = 'passed';
   console.log(`\nRAMA browser smoke passed (${report.steps.length} steps). Evidence: test-results/smoke-report.json`);
 } catch (error) {
@@ -339,8 +353,7 @@ try {
   report.failure = { message: error.message, stack: error.stack };
   const page = mobile && !mobile.isClosed() ? mobile : desktop && !desktop.isClosed() ? desktop : null;
   if (page) {
-    await page.clock.resume().catch(() => {});
-    await page.screenshot({ path: join(output, 'failure.png'), fullPage: true, timeout: 30_000 }).catch(() => {});
+    await page.screenshot({ path: join(output, 'failure.png'), fullPage: false, timeout: 15_000 }).catch(() => {});
     report.failure.diagnostics = await page.evaluate(() => window.rama?.getDiagnostics()).catch(() => null);
   }
   if (!browser) report.failure.serverOutput = serverOutput;

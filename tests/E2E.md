@@ -44,17 +44,28 @@ test resources. The public `window.rama.getSnapshot()` and `getDiagnostics()`
 interfaces are used only to read outcomes. Mobile receives the desktop context's
 normal browser storage snapshot.
 
-Playwright's browser clock advances construction, training and expedition time.
-The application still processes its own interval and persistence logic. This
-keeps the smoke run short without replacing the game simulation.
-Before screenshots the clock resumes and two app animation frames complete.
-Screenshots use a bounded 30-second compositor timeout; they do not cancel CSS
-animations on top of the context's existing reduced-motion preference.
+The smoke run uses real browser time throughout. It waits for the application's
+actual construction, training and expedition timers: approximately **70 seconds**
+in total (12 for construction, 15 and 18 for training, 25 for the expedition).
+No fake clock, Date override, timer
+replacement or animation-frame replacement is installed. Each queue is polled
+for completion with a timeout based on its recorded end time plus 10 seconds;
+unexpected smoke actions longer than 50 seconds are rejected. The report records
+expected remaining time and observed elapsed time for each queue.
+
+Screenshots capture the exact desktop/mobile viewport. A capture has a bounded
+15-second timeout and one retry, with every outcome recorded. If both attempts
+fail, gameplay validation continues so a compositor problem does not hide later
+functional defects. A separate final gate still requires **all seven screenshots**
+to have succeeded; missing visual evidence can never yield a passing run.
+Screenshots do not cancel CSS animations on top of the context's existing
+reduced-motion preference.
 
 ## Evidence and limitations
 
 `test-results/` is ignored by Git. Each run writes `smoke-report.json` with step
-results, viewport sizes, render diagnostics and error details. It also captures
+results, queue timings, screenshot attempts, viewport sizes, render diagnostics
+and error details. It also captures
 desktop city, world, heroes, night, mobile city and mobile dialog screenshots.
 The backup round trip also retains the real downloaded `exported-backup.json`.
 Failures after browser startup additionally capture `failure.png`.
