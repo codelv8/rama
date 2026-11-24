@@ -31,9 +31,18 @@ and loaded fonts. The smoke does not use `networkidle` as a readiness proxy.
 - Selecting the sawmill marker opens its modal. The upgrade spends resources,
   waits for its timer, completes, and restores focus when dismissed with Escape.
 - The training UI creates three guardians and three archers after their timers.
+- The hero roster contains the original three characters and all ten additions.
+  Each added portrait has a unique crop from the two same-origin expansion
+  atlases, and both actual image files decode successfully in the browser.
 - A hero point is spent through the ability button and increases the chosen stat.
+  Selecting Garuda preserves shared level, XP, unspent points and allocated
+  attack/defense/fortune; updates the header and city HUD; and increases displayed
+  army power without changing troop counts.
 - Selecting the grove on the world map sends troops, shows a travel marker, and
   returns survivors, loot, a completed destination, and a victory report.
+  The departing expedition records Garuda as commander. Another hero's selection
+  is disabled with an explanation while the army travels, and Garuda remains
+  selected after the persistence reload.
 - Construction, recruitment and victory quests can be claimed in sequence.
 - Reloading preserves buildings, army, hero, completed destinations and rewards.
 - Exporting downloads a valid backup. After renaming the city through settings,
@@ -43,6 +52,8 @@ and loaded fonts. The smoke does not use `networkidle` as a readiness proxy.
 - Day/night controls affect both the interface and the 3D scene.
 - Mobile touch opens building and expedition dialogs without horizontal overflow
   or dialog boundaries extending outside the viewport.
+- Mobile can open the expanded roster and Sita's portrait modal, select her by
+  touch, retain shared progression, and close the dialog without viewport overflow.
 - No uncaught page errors, console errors, failed same-origin asset requests or
   HTTP error responses occurred during the flow.
 
@@ -64,7 +75,7 @@ expected remaining time and observed elapsed time for each queue.
 Screenshots capture the exact desktop/mobile viewport. A capture has a bounded
 15-second timeout and one retry, with every outcome recorded. If both attempts
 fail, gameplay validation continues so a compositor problem does not hide later
-functional defects. A separate final gate still requires **all seven screenshots**
+functional defects. A separate final gate still requires **all eight screenshots**
 to have succeeded; missing visual evidence can never yield a passing run.
 Screenshots do not cancel CSS animations on top of the context's existing
 reduced-motion preference.
@@ -77,7 +88,9 @@ render diagnostics and error details. On failure it retains recent request and
 navigation lifecycle events, pending asset requests, page-crash/browser-disconnect
 events, and a bounded runtime probe to distinguish a navigation stall from an
 application initialization failure. It also captures
-desktop city, world, heroes, night, mobile city and mobile dialog screenshots.
+desktop city, world, heroes, night, mobile city and mobile building, expedition and
+hero dialog screenshots. Hero roster, atlas decoding and selection outcomes are
+also recorded in the report.
 The backup round trip also retains the real downloaded `exported-backup.json`.
 Failures after browser startup additionally capture `failure.png`.
 

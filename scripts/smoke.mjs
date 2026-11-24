@@ -13,7 +13,8 @@ const output = join(root, 'test-results');
 const port = Number(process.env.RAMA_SMOKE_PORT || 4178);
 assert(Number.isInteger(port) && port >= 1024 && port <= 65535, 'RAMA_SMOKE_PORT must be an integer from 1024 to 65535.');
 const origin = `http://127.0.0.1:${port}`;
-const requiredScreenshots = ['desktop-city.png', 'desktop-heroes.png', 'desktop-world.png', 'desktop-night.png', 'mobile-city.png', 'mobile-building-dialog.png', 'mobile-expedition-dialog.png'];
+const newHeroIds = ['lakshman', 'sita', 'sugriva', 'angada', 'jambavan', 'nilaphat', 'vibhishana', 'garuda', 'suphannamatcha', 'macchanu'];
+const requiredScreenshots = ['desktop-city.png', 'desktop-heroes.png', 'desktop-world.png', 'desktop-night.png', 'mobile-city.png', 'mobile-building-dialog.png', 'mobile-expedition-dialog.png', 'mobile-hero-dialog.png'];
 const report = { status: 'running', target: 'production-preview', timing: 'real-time', startedAt: new Date().toISOString(), viewports: { desktop: { width: 1440, height: 1000 }, mobile: { width: 390, height: 844 } }, steps: [], navigations: [], queueWaits: [], screenshots: [], captureAttempts: [], errors: [] };
 let browser;
 let server;
@@ -89,6 +90,49 @@ async function waitForServer() {
 }
 
 const snapshot = (page) => page.evaluate(() => window.rama.getSnapshot());
+
+function assertSharedHeroProgress(after, before) {
+  for (const key of ['level', 'xp', 'points', 'attack', 'defense', 'fortune']) {
+    assert.equal(after[key], before[key], `Selecting another hero must preserve shared ${key}.`);
+  }
+}
+
+async function readArmyPower(page) {
+  await page.locator('.main-nav [data-tab="army"]').click();
+  const value = Number((await page.locator('.power-pill b').textContent()).replace(/[^\d.-]/g, ''));
+  assert(Number.isFinite(value) && value > 0, 'The army screen must show a positive numeric power.');
+  return value;
+}
+
+async function inspectHeroRoster(page) {
+  const ids = await page.locator('#screen-panel .hero-card[data-hero-id]').evaluateAll((cards) => cards.map((card) => card.dataset.heroId));
+  assert.deepEqual([...ids].sort(), ['rama', 'hanuman', 'thotsakan', ...newHeroIds].sort(), 'The all-heroes view must contain the original three and all ten new characters.');
+  const portraits = await page.evaluate((heroIds) => heroIds.map((id) => {
+    const portrait = document.querySelector(`.hero-card[data-hero-id="${id}"] .portrait[data-hero-portrait="${id}"]`);
+    const image = portrait?.querySelector('image');
+    const href = image?.getAttribute('href');
+    return { id, url: href ? new URL(href, document.baseURI).href : null, crop: portrait?.querySelector('svg')?.getAttribute('viewBox') ?? null };
+  }), newHeroIds);
+  for (const portrait of portraits) {
+    assert(portrait.url, `${portrait.id} is missing its portrait image.`);
+    assert.equal(new URL(portrait.url).origin, origin, `${portrait.id} must load artwork from this site, not an external host.`);
+    assert(portrait.crop, `${portrait.id} is missing its atlas crop.`);
+  }
+  const atlasUrls = [...new Set(portraits.map((portrait) => portrait.url))];
+  assert.equal(atlasUrls.length, 2, 'The ten new portraits must use the two locally bundled expansion atlases.');
+  assert.equal(new Set(portraits.map((portrait) => `${portrait.url}#${portrait.crop}`)).size, 10, 'Each added character must have a distinct portrait crop.');
+  const atlases = await page.evaluate(async (urls) => Promise.all(urls.map(async (url) => {
+    const image = new Image();
+    image.src = url;
+    let timer;
+    try {
+      await Promise.race([image.decode(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Portrait atlas did not decode: ${url}`)), 10_000); })]);
+      return { path: new URL(url).pathname, width: image.naturalWidth, height: image.naturalHeight };
+    } finally { clearTimeout(timer); }
+  })), atlasUrls);
+  for (const atlas of atlases) assert(atlas.width > 0 && atlas.height > 0, `Portrait atlas is not a decoded image: ${atlas.path}`);
+  report.heroRoster = { total: ids.length, added: newHeroIds, uniquePortraitCrops: 10, atlases };
+}
 
 async function ready(page) {
   await page.waitForFunction(() => Boolean(window.rama?.getDiagnostics()), null, { timeout: 30_000 });
@@ -259,16 +303,39 @@ try {
   await step('Train three archers to complete the recruitment mission', () => train(desktop, 'archer', 3));
   await step('Claim the recruitment quest', () => claimQuest(desktop, 'recruit'));
 
-  await step('Allocate a hero ability point', async () => {
+  await step('Inspect all thirteen hero portraits and allocate a shared ability point', async () => {
     await desktop.locator('.main-nav [data-tab="heroes"]').click();
+    await inspectHeroRoster(desktop);
     await capture(desktop, 'desktop-heroes.png');
     const before = await snapshot(desktop);
-    await desktop.locator('#screen-panel [data-action="hero"][data-id="rama"]').click();
+    await desktop.locator('.hero-card[data-hero-id="rama"] [data-action="hero"]').click();
     await desktop.locator('[data-action="allocate"][data-id="attack"]').click();
     const after = await snapshot(desktop);
     assert.equal(after.hero.attack, before.hero.attack + 1);
     assert.equal(after.hero.points, before.hero.points - 1);
     await closeDialog(desktop);
+  });
+
+  await step('Select Garuda without resetting progress and apply his army bonus', async () => {
+    const baselinePower = await readArmyPower(desktop);
+    const before = await snapshot(desktop);
+    assert.equal(before.hero.id, 'rama');
+    await desktop.locator('.main-nav [data-tab="heroes"]').click();
+    await desktop.locator('.hero-card[data-hero-id="garuda"] [data-action="hero"]').click();
+    const select = desktop.locator('[data-action="select-hero"][data-id="garuda"]');
+    assert(await select.isEnabled(), 'Garuda should be selectable when no expedition is active.');
+    await select.click();
+    const after = await snapshot(desktop);
+    assert.equal(after.hero.id, 'garuda');
+    assertSharedHeroProgress(after.hero, before.hero);
+    assert.deepEqual(after.army, before.army, 'Selecting a hero must not silently add or remove troops.');
+    if (await desktop.locator('#game-dialog').evaluate((dialog) => dialog.open)) await closeDialog(desktop);
+    await desktop.locator('.main-nav [data-tab="city"]').click();
+    assert(await desktop.locator('.player-button[data-active-hero="garuda"]').isVisible(), 'The player header must reflect the selected hero.');
+    assert(await desktop.locator('.hero-mini[data-id="garuda"]').isVisible(), 'The city HUD must reflect the selected hero.');
+    const selectedPower = await readArmyPower(desktop);
+    assert(selectedPower > baselinePower, 'Garuda must raise displayed army power with the same troops and allocated points.');
+    report.heroSelection = { selected: 'garuda', baselinePower, selectedPower, sharedProgressPreserved: true };
   });
 
   await step('Send the army to the grove and resolve a real expedition', async () => {
@@ -282,8 +349,16 @@ try {
     await desktop.locator('#expedition-confirm').click();
     const queued = await snapshot(desktop);
     assert.equal(queued.queues.expedition?.nodeId, 'grove');
+    assert.equal(queued.queues.expedition?.heroId, 'garuda', 'The expedition must retain the hero who led its departure.');
     assert(Object.values(queued.army).reduce((sum, count) => sum + count, 0) < Object.values(before.army).reduce((sum, count) => sum + count, 0), 'Deployed troops must leave the available army.');
     await desktop.waitForSelector('.world-march-marker');
+    await desktop.locator('.main-nav [data-tab="heroes"]').click();
+    await desktop.locator('.hero-card[data-hero-id="lakshman"] [data-action="hero"]').click();
+    assert(await desktop.locator('[data-action="select-hero"][data-id="lakshman"]').isDisabled(), 'Hero switching must be blocked while the army is travelling.');
+    assert(await desktop.locator('.hero-travel-lock').isVisible(), 'The blocked selection needs an explanation.');
+    assert.equal((await snapshot(desktop)).hero.id, 'garuda', 'Opening another hero during travel must not change the commander.');
+    await closeDialog(desktop);
+    await desktop.locator('.main-nav [data-tab="world"]').click();
     await waitForQueue(desktop, 'expedition');
     const after = await snapshot(desktop);
     assert(after.completedNodes.includes('grove'), 'Winning the grove must complete the destination.');
@@ -305,6 +380,7 @@ try {
     await navigate(desktop, true);
     const after = await snapshot(desktop);
     for (const key of ['buildings', 'army', 'hero', 'completedNodes', 'quests']) assert.deepEqual(after[key], before[key], `Reload did not preserve ${key}.`);
+    assert.equal(after.hero.id, 'garuda', 'Reload must preserve the newly selected commander.');
     report.persistedProgress = { buildings: after.buildings, army: after.army, hero: after.hero, completedNodes: after.completedNodes, claimedQuests: after.quests.claimed };
   });
 
@@ -384,11 +460,35 @@ try {
     await closeDialog(mobile);
   });
 
+  await step('Select another hero by touch without losing progress or overflowing the modal', async () => {
+    const before = await snapshot(mobile);
+    assert.equal(before.hero.id, 'garuda', 'The mobile saved game should retain the desktop commander.');
+    await mobile.locator('.main-nav [data-tab="heroes"]').tap();
+    assert.equal(await mobile.locator('#screen-panel .hero-card[data-hero-id]').count(), 13);
+    await mobile.locator('.hero-card[data-hero-id="sita"] [data-action="hero"]').tap();
+    await assertFitsViewport(mobile, '#game-dialog');
+    await capture(mobile, 'mobile-hero-dialog.png');
+    const select = mobile.locator('[data-action="select-hero"][data-id="sita"]');
+    assert(await select.isEnabled());
+    await select.tap();
+    const after = await snapshot(mobile);
+    assert.equal(after.hero.id, 'sita');
+    assertSharedHeroProgress(after.hero, before.hero);
+    if (await mobile.locator('#game-dialog').evaluate((dialog) => dialog.open)) {
+      await assertFitsViewport(mobile, '#game-dialog');
+      await closeDialog(mobile);
+    }
+    assert.equal(await mobile.locator('#game-dialog').evaluate((dialog) => dialog.open), false);
+    assert(await mobile.locator('.player-button[data-active-hero="sita"]').isVisible());
+    assert(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'The mobile hero screen must not scroll horizontally.');
+    report.mobileHeroSelection = { selected: 'sita', sharedProgressPreserved: true, modalFits: true };
+  });
+
   await step('No uncaught page errors or failed application assets', async () => {
     assert.deepEqual(report.errors, [], JSON.stringify(report.errors, null, 2));
   });
 
-  await step('All seven required screenshots were captured successfully', async () => {
+  await step(`All ${requiredScreenshots.length} required screenshots were captured successfully`, async () => {
     const missing = requiredScreenshots.filter((filename) => !report.screenshots.includes(filename));
     assert.deepEqual(missing, [], `Required visual evidence is missing: ${missing.join(', ')}. See captureAttempts for compositor errors.`);
   });

@@ -1,4 +1,4 @@
-import { BUILDINGS, TROOPS, QUESTS, WORLD_NODES, RESOURCE_IDS } from './content.js';
+import { BUILDINGS, TROOPS, HEROES, QUESTS, WORLD_NODES, RESOURCE_IDS } from './content.js';
 
 export const SAVE_VERSION = 1;
 export const MAX_OFFLINE_MS = 2 * 60 * 60 * 1000;
@@ -7,6 +7,7 @@ const MAX_EVENTS = 40;
 const MAX_LEVEL = 6;
 const buildingById = Object.assign(Object.create(null), Object.fromEntries(BUILDINGS.map((item) => [item.id, item])));
 const troopById = Object.assign(Object.create(null), Object.fromEntries(TROOPS.map((item) => [item.id, item])));
+const heroById = Object.assign(Object.create(null), Object.fromEntries(HEROES.map((item) => [item.id, item])));
 const nodeById = Object.assign(Object.create(null), Object.fromEntries(WORLD_NODES.map((item) => [item.id, item])));
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const finite = (value, fallback = 0) => typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -83,10 +84,40 @@ export function getArmySize(state, army = state.army) {
   return TROOPS.reduce((total, troop) => total + (army[troop.id] || 0), 0);
 }
 
+/** Selection changes the leader only; level, XP, allocated points, and stats are shared. */
+export function getActiveHero(state) {
+  const id = state?.hero?.id;
+  const hero = typeof id === 'string' ? heroById[id] : null;
+  return hero?.available ? hero : heroById.rama;
+}
+
+export function getHeroBonuses(state) {
+  return { ...getActiveHero(state).bonuses };
+}
+
+/** Passive points use the same combat/loot units as allocated hero stat points. */
+export function getEffectiveHeroStats(state) {
+  const bonuses = getHeroBonuses(state);
+  return Object.fromEntries(['attack', 'defense', 'fortune'].map((stat) => [stat, finite(state?.hero?.[stat]) + bonuses[stat]]));
+}
+
+export function selectHero(state, heroId, now = Date.now()) {
+  const hero = typeof heroId === 'string' ? heroById[heroId] : null;
+  if (!hero) return fail('ไม่พบวีรชนนี้');
+  if (!hero.available) return fail('วีรชนนี้เป็นสมุดภาพตำนาน ยังเลือกนำทัพไม่ได้');
+  if (state.queues.expedition) return fail('กองทัพกำลังเดินทาง รอให้กลับเมืองก่อนเปลี่ยนวีรชน');
+  if (state.hero.id === heroId) return success(`${hero.name}เป็นวีรชนประจำนครอยู่แล้ว`, { heroId, changed: false });
+  state.hero.id = heroId;
+  const at = Math.max(state.lastTick, safeTime(now));
+  addEvent(state, 'hero', 'เปลี่ยนวีรชนประจำนคร', `${hero.name}พร้อมนำทัพ โดยคงระดับและความสามารถที่พัฒนาร่วมกัน`, at, { heroId });
+  return success(`เลือก${hero.name}เป็นวีรชนประจำนครแล้ว`, { heroId, changed: true });
+}
+
 export function getArmyPower(state, army = state.army) {
   if (getArmySize(state, army) === 0) return 0;
   const soldiers = TROOPS.reduce((total, troop) => total + (army[troop.id] || 0) * troop.attack, 0);
-  return Math.round(soldiers * (1 + state.hero.attack * 0.045) + 45 + state.hero.level * 8 + state.buildings.shrine * 5);
+  const stats = getEffectiveHeroStats(state);
+  return Math.round(soldiers * (1 + stats.attack * 0.045) + 45 + state.hero.level * 8 + state.buildings.shrine * 5);
 }
 
 export function canAfford(state, cost) {
@@ -114,7 +145,7 @@ function gainXp(state, amount, at) {
     state.hero.xp -= state.hero.level * 100;
     state.hero.level += 1;
     state.hero.points += 2;
-    addEvent(state, 'hero', 'วีรชนเลื่อนระดับ', `พระรามถึงระดับ ${state.hero.level} ได้รับแต้มความสามารถ 2 แต้ม`, at);
+    addEvent(state, 'hero', 'วีรชนเลื่อนระดับ', `${getActiveHero(state).name}ถึงระดับ ${state.hero.level} ได้รับแต้มความสามารถ 2 แต้ม`, at, { heroId: getActiveHero(state).id });
   }
   if (state.hero.level === 20) state.hero.xp = Math.min(state.hero.xp, 1999);
 }
@@ -186,7 +217,9 @@ export function getExpeditionPreview(state, nodeId, troopCount = getArmySize(sta
   const troops = selectTroops(state, validCount ? troopCount : 0);
   const power = getArmyPower(state, troops);
   const willWin = power >= node.threat;
-  const defense = state.hero.defense + state.buildings.wall + state.buildings.shrine;
+  const heroId = getActiveHero(state).id;
+  const heroStats = getEffectiveHeroStats(state);
+  const defense = heroStats.defense + state.buildings.wall + state.buildings.shrine;
   const cost = { ...resourceBag(), rice: validCount ? troopCount * 8 : 0 };
   let reason = '';
   if (previous && !state.completedNodes.includes(previous.id)) reason = `ต้องพิชิต${previous.name}ก่อน`;
@@ -194,8 +227,8 @@ export function getExpeditionPreview(state, nodeId, troopCount = getArmySize(sta
   else if (state.queues.expedition) reason = 'กองทัพกำลังเดินทางอยู่';
   else if (!validCount) reason = 'เลือกจำนวนทหารที่มีอยู่ 1 นายขึ้นไป';
   else if (!canAfford(state, cost)) reason = 'ข้าวไม่พอสำหรับเสบียงเดินทัพ';
-  const reward = Object.fromEntries(RESOURCE_IDS.map((id) => [id, Math.round((node.reward[id] || 0) * (1 + state.hero.fortune * 0.035))]));
-  return { available: !reason, unlocked, reason, troops, count: validCount ? troopCount : 0, power, threat: node.threat, willWin, estimatedLosses: validCount ? getLossCount(troopCount, power, node.threat, defense, willWin) : 0, duration: node.duration, cost, rewards: reward, completed: state.completedNodes.includes(nodeId) };
+  const reward = Object.fromEntries(RESOURCE_IDS.map((id) => [id, Math.round((node.reward[id] || 0) * (1 + heroStats.fortune * 0.035))]));
+  return { available: !reason, unlocked, reason, heroId, defense, fortune: heroStats.fortune, troops, count: validCount ? troopCount : 0, power, threat: node.threat, willWin, estimatedLosses: validCount ? getLossCount(troopCount, power, node.threat, defense, willWin) : 0, duration: node.duration, cost, rewards: reward, completed: state.completedNodes.includes(nodeId) };
 }
 
 export function sendExpedition(state, nodeId, troopCount, now = Date.now()) {
@@ -205,9 +238,9 @@ export function sendExpedition(state, nodeId, troopCount, now = Date.now()) {
   spend(state, preview.cost);
   for (const troop of TROOPS) state.army[troop.id] -= preview.troops[troop.id];
   state.queues.expedition = {
-    nodeId, troops: preview.troops, power: preview.power,
-    defense: state.hero.defense + state.buildings.wall + state.buildings.shrine,
-    fortune: state.hero.fortune,
+    nodeId, heroId: preview.heroId, troops: preview.troops, power: preview.power,
+    defense: preview.defense,
+    fortune: preview.fortune,
     startedAt, endsAt: startedAt + preview.duration * 1000,
   };
   state.stats.expeditions += 1;
@@ -309,7 +342,7 @@ function resolveExpedition(state, at) {
     if (node.id === 'lanka') state.campaignWon = true;
   } else gainXp(state, 10, at);
   state.queues.expedition = null;
-  addEvent(state, victory ? 'victory' : 'defeat', victory ? `ชัยชนะที่${node.name}` : `ถอยทัพจาก${node.name}`, `ทหารกลับเมือง ${count - losses} นาย · สูญเสีย ${losses} นาย`, at, { nodeId: node.id, victory, losses, survivors: count - losses, rewards, power: queue.power, threat: node.threat });
+  addEvent(state, victory ? 'victory' : 'defeat', victory ? `ชัยชนะที่${node.name}` : `ถอยทัพจาก${node.name}`, `ทหารกลับเมือง ${count - losses} นาย · สูญเสีย ${losses} นาย`, at, { nodeId: node.id, heroId: queue.heroId || getActiveHero(state).id, victory, losses, survivors: count - losses, rewards, power: queue.power, threat: node.threat });
   if (victory && node.id === 'lanka') addEvent(state, 'campaign', 'จบแคมเปญ · ตำนานบทใหม่', 'อโยธยาคืนความสงบสู่หิมพานต์ คุณยังพัฒนาเมืองและออกสำรวจต่อได้', at);
 }
 
@@ -382,6 +415,7 @@ export function loadGame(raw, now = Date.now()) {
   for (const id of RESOURCE_IDS) state.resources[id] = clamp(finite(value.resources[id]), 0, capacity);
   state.army = cleanArmy(value.army);
   if (plain(value.hero)) {
+    if (typeof value.hero.id === 'string' && heroById[value.hero.id]?.available) state.hero.id = value.hero.id;
     state.hero.level = clamp(integer(value.hero.level, 1), 1, 20);
     state.hero.xp = clamp(integer(value.hero.xp), 0, state.hero.level * 100 - 1);
     let available = 3 + (state.hero.level - 1) * 2;
@@ -402,6 +436,7 @@ export function loadGame(raw, now = Date.now()) {
       .slice(0, MAX_EVENTS).map((event, i) => ({
         id: `saved-event-${i}`, kind: event.kind, title: event.title.slice(0, 120), message: event.message.slice(0, 300), at: clamp(finite(event.at, time), 0, time),
         ...(nodeById[event.nodeId] ? { nodeId: event.nodeId } : {}),
+        ...(typeof event.heroId === 'string' && heroById[event.heroId]?.available ? { heroId: event.heroId } : {}),
         ...(typeof event.victory === 'boolean' ? { victory: event.victory } : {}),
         ...(Number.isFinite(event.losses) ? { losses: clamp(integer(event.losses), 0, MAX_ARMY) } : {}),
         ...(Number.isFinite(event.survivors) ? { survivors: clamp(integer(event.survivors), 0, MAX_ARMY) } : {}),
@@ -418,11 +453,16 @@ export function loadGame(raw, now = Date.now()) {
   if (expeditionTime && nodeById[expeditionQueue.nodeId]) {
     const troops = cleanArmy(expeditionQueue.troops, MAX_ARMY - getArmySize(state));
     if (getArmySize(state, troops) > 0) {
+      const heroId = typeof expeditionQueue.heroId === 'string' && heroById[expeditionQueue.heroId]?.available
+        ? expeditionQueue.heroId : getActiveHero(state).id;
+      // A saved dispatch owns its leader until return. Old v1 queues inherit Rama.
+      state.hero.id = heroId;
+      const heroStats = getEffectiveHeroStats(state);
       state.queues.expedition = {
-        nodeId: expeditionQueue.nodeId, troops, ...expeditionTime,
+        nodeId: expeditionQueue.nodeId, heroId, troops, ...expeditionTime,
         power: clamp(finite(expeditionQueue.power), 1, getArmyPower(state, troops)),
-        defense: clamp(finite(expeditionQueue.defense), 0, state.hero.defense + state.buildings.wall + state.buildings.shrine),
-        fortune: clamp(finite(expeditionQueue.fortune), 0, state.hero.fortune),
+        defense: clamp(finite(expeditionQueue.defense), 0, heroStats.defense + state.buildings.wall + state.buildings.shrine),
+        fortune: clamp(finite(expeditionQueue.fortune), 0, heroStats.fortune),
       };
     }
   }

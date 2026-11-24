@@ -13,6 +13,7 @@ import {
   getUpgradeDuration, upgradeBuilding, getArmySize, getArmyPower, getTrainingCost,
   getTrainingDuration, trainTroops, getExpeditionPreview, sendExpedition,
   getQuestProgress, claimQuest, allocateHeroPoint, canAfford,
+  getActiveHero, getHeroBonuses, getEffectiveHeroStats, selectHero,
 } from './game/engine.js';
 import { createVillage } from './render/village.js';
 import { createWorldMap } from './render/world-map.js';
@@ -24,7 +25,15 @@ const SETTINGS_KEY = 'rama.preferences.v1';
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (s) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[s]));
 const number = (value) => Math.floor(Number(value) || 0).toLocaleString('en-US');
-const portrait = (id = 'rama', extra = '') => `<div class="portrait portrait-${id} ${extra}" role="img" aria-label="${id === 'rama' ? 'พระราม' : id === 'hanuman' ? 'หนุมาน' : 'ทศกัณฐ์'}"></div>`;
+const portrait = (id = 'rama', extra = '') => {
+  const hero = HEROES.find((entry) => entry.id === id) || HEROES[0];
+  const atlas = hero.portrait;
+  const atlasUrl = atlas ? `${import.meta.env.BASE_URL}${atlas.src.replace(/^\/+/, '')}` : '';
+  // A one-cell SVG viewBox clips the atlas before covering the target container.
+  // This keeps rows isolated in both wide cards and small, circular avatars.
+  const image = atlas ? `<svg viewBox="${atlas.column} ${atlas.row} 1 1" preserveAspectRatio="${extra.includes('portrait-dialog') ? 'xMidYMin' : 'xMidYMid'} slice" aria-hidden="true" focusable="false"><image href="${esc(atlasUrl)}" x="0" y="0" width="${atlas.columns}" height="${atlas.rows}" preserveAspectRatio="none" /></svg>` : '';
+  return `<div class="portrait portrait-${esc(hero.id)} ${atlas ? 'portrait-atlas' : ''} ${extra}" data-hero-portrait="${esc(hero.id)}" role="img" aria-label="${esc(hero.name)}">${image}</div>`;
+};
 const item = (array, id) => array.find((entry) => entry.id === id);
 const readStorage = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
 const storedSave = readStorage(SAVE_KEY);
@@ -44,6 +53,8 @@ let night = Boolean(preferences.night);
 let modalCount = 1;
 let pendingRestore = null;
 let pendingRestoreVictory = false;
+let heroQuery = '';
+let heroFilter = 'all';
 const audio = createAudio();
 audio.setEnabled(Boolean(preferences.sound), false);
 let village;
@@ -63,7 +74,7 @@ $('#app').innerHTML = `
         <button class="icon-button sound-button" data-action="sound" aria-label="${audio.enabled ? 'ปิดเสียง' : 'เปิดเสียง'}" title="${audio.enabled ? 'ปิดเสียง' : 'เปิดเสียง'}">${icon(audio.enabled ? 'volume' : 'mute')}</button>
         <button class="icon-button" data-action="help" aria-label="วิธีเล่น" title="วิธีเล่น">${icon('help')}</button>
         <span class="header-divider"></span>
-        <button class="player-button" data-action="settings" aria-label="ตั้งค่าอาณาจักร">${portrait('rama')}<span><b>ผู้ครองนคร</b><small>อาณาจักรของคุณ</small></span>${icon('down')}</button>
+        <button class="player-button" data-action="settings" data-active-hero="${getActiveHero(state).id}" aria-label="ตั้งค่าอาณาจักร">${portrait(getActiveHero(state).id)}<span><b>${esc(getActiveHero(state).name)}</b><small>วีรชนประจำนคร</small></span>${icon('down')}</button>
       </div>
     </header>
     <section class="resource-bar" aria-label="ทรัพยากรอาณาจักร">
@@ -107,6 +118,12 @@ function queueCard(kind, queue) {
   return `<div class="queue-card"><span class="queue-icon">${icon(glyph)}</span><div><b>${label}</b><small>${kind === 'building' ? `ระดับ ${queue.targetLevel}` : kind === 'training' ? 'กำลังเตรียมความพร้อม' : 'กองทัพกำลังเดินทาง'}</small><div class="progress-track"><i data-progress-start="${queue.startedAt}" data-progress-end="${queue.endsAt}" style="width:${progress(queue)}%"></i></div></div><span class="queue-timer" data-countdown="${queue.endsAt}">${countdown(queue.endsAt)}</span></div>`;
 }
 function renderHud() {
+  const activeHero = getActiveHero(state);
+  const player = $('.player-button');
+  if (player.dataset.activeHero !== activeHero.id) {
+    player.dataset.activeHero = activeHero.id;
+    player.innerHTML = `${portrait(activeHero.id)}<span><b>${esc(activeHero.name)}</b><small>วีรชนประจำนคร</small></span>${icon('down')}`;
+  }
   const quest = QUESTS.find(({ id }) => !state.quests.claimed.includes(id));
   const qp = quest ? getQuestProgress(state, quest.id) : null;
   $('#quest-hud').innerHTML = quest ? `
@@ -122,7 +139,7 @@ function renderHud() {
     <div class="hud-eyebrow">${icon('clock')} ความเคลื่อนไหว <span>${queues.length}</span></div>
     ${queues.length ? queues.map(([kind, queue]) => queueCard(kind, queue)).join('') : `<div class="peaceful-state"><span>${icon('hammer')}</span><b>ช่างก่อสร้างพร้อมแล้ว</b><p>เลือกอาคารเพื่อพัฒนาเมือง</p></div>`}
     <div class="hud-divider"></div><button class="army-summary" data-tab="army"><span class="army-summary-icon">${icon('shield')}</span><div><b>กองทัพของคุณ</b><span><strong>${getArmySize(state)}</strong> นายพร้อมประจำการ</span></div>${icon('chevron')}</button>
-    <button class="hero-mini" data-action="hero" data-id="rama">${portrait('rama')}<div><small>วีรชนประจำนคร</small><b>พระราม <span>Lv. ${state.hero.level}</span></b></div>${state.hero.points > 0 ? `<i class="points-badge">+${state.hero.points}</i>` : icon('chevron')}</button>`;
+    <button class="hero-mini" data-action="hero" data-id="${activeHero.id}">${portrait(activeHero.id)}<div><small>วีรชนประจำนคร</small><b>${esc(activeHero.name)} <span>Lv. ${state.hero.level}</span></b></div>${state.hero.points > 0 ? `<i class="points-badge">+${state.hero.points}</i>` : icon('chevron')}</button>`;
   $('#building-dock').innerHTML = `<div class="dock-label"><span class="eyebrow">BUILD YOUR LEGACY</span><b>พัฒนาอาณาจักร</b><span>${BUILDINGS.length} สิ่งก่อสร้าง</span></div><div class="building-list">${BUILDINGS.map((building) => `<button class="building-card ${state.queues.building?.buildingId === building.id ? 'constructing' : ''}" data-action="building" data-id="${building.id}"><span class="building-icon building-${building.id}">${icon(building.icon)}</span><span class="building-card-name">${building.name}</span><span class="level-tag">${state.queues.building?.buildingId === building.id ? `${icon('hammer')} กำลังสร้าง` : `ระดับ ${state.buildings[building.id]}`}</span></button>`).join('')}</div>`;
   $('#report-count').textContent = state.events.length;
   const hasReward = QUESTS.some((q) => { const p = getQuestProgress(state, q.id); return p.complete && p.unlocked && !p.claimed; });
@@ -178,8 +195,69 @@ function changeTab(tab) {
 function screenHeader(kicker, title, description, aside = '') {
   return `<div class="screen-heading"><div><div class="eyebrow">${kicker}</div><h1>${title}</h1><p>${description}</p></div>${aside}</div>`;
 }
+const HERO_STATS = [
+  ['attack', 'swords', 'โจมตี'], ['defense', 'shield', 'ป้องกัน'], ['fortune', 'sparkles', 'โชคลาภ'],
+];
+function heroBonusChips(hero) {
+  const bonuses = hero.id === getActiveHero(state).id ? getHeroBonuses(state) : hero.bonuses || {};
+  const entries = HERO_STATS.filter(([stat]) => Number(bonuses[stat]) > 0);
+  return entries.length ? `<div class="hero-bonuses" aria-label="แต้มพลังประจำตัว">${entries.map(([stat, glyph, label]) => `<span>${icon(glyph)}${label} <b>+${number(bonuses[stat])}</b></span>`).join('')}</div>` : '<div class="hero-bonuses"><span>พลังจากการพัฒนาผู้นำ</span></div>';
+}
+function heroCard(hero) {
+  const active = getActiveHero(state).id === hero.id;
+  return `<article class="hero-card ${active ? 'hero-active' : ''} ${!hero.available ? 'hero-lore-card' : ''}" data-hero-id="${hero.id}">
+    <div class="hero-art">${portrait(hero.id)}<span class="hero-faction">${esc(hero.faction)}</span>${active ? '<span class="active-hero"><i></i> วีรชนประจำนคร</span>' : `<span class="legend-tag">${hero.available ? 'พร้อมร่วมทัพ' : 'สมุดภาพตำนาน'}</span>`}${hero.portrait ? '<span class="hero-new-tag">ใหม่</span>' : ''}</div>
+    <div class="hero-card-info"><div><small>${esc(hero.role || hero.title)}</small><h2>${esc(hero.name)}</h2></div>${active ? `<span class="hero-level">Lv. ${state.hero.level}</span>` : icon(hero.available ? 'crown' : 'scroll')}</div>
+    <p class="hero-card-description">${esc(hero.description)}</p>
+    ${hero.available ? `<div class="hero-card-ability"><span>${icon('sparkles')} ${esc(hero.ability?.name || 'พลังแห่งผู้นำ')}</span><p>${esc(hero.ability?.description || 'พัฒนาผู้นำเพื่อสนับสนุนกองทัพของอาณาจักร')}</p>${heroBonusChips(hero)}</div>` : '<div class="hero-card-ability hero-lore-note"><span>เรื่องราวแห่งรามเกียรติ์</span><p>พบกับบทบาทและเรื่องราวของตัวละครในตำนาน</p></div>'}
+    <button class="button ${active ? 'primary' : 'soft'} full" data-action="hero" data-id="${hero.id}">${active ? `พัฒนาผู้นำ${state.hero.points > 0 ? ` · ${state.hero.points} แต้ม` : ''}` : hero.available ? 'ดูความสามารถและเลือก' : 'อ่านเรื่องราว'}${icon('arrow')}</button>
+  </article>`;
+}
+function renderHeroResults() {
+  const container = $('#hero-results');
+  if (!container) return;
+  const query = heroQuery.trim().normalize('NFKC').toLocaleLowerCase('th-TH');
+  const ordered = [...HEROES.filter((hero) => hero.available), ...HEROES.filter((hero) => !hero.available)];
+  const heroes = ordered.filter((hero) => {
+    const matchesFilter = heroFilter === 'all' || (heroFilter === 'selectable' ? hero.available : !hero.available);
+    const text = [hero.name, hero.id, hero.role, hero.title, hero.faction, hero.ability?.name].join(' ').normalize('NFKC').toLocaleLowerCase('th-TH');
+    return matchesFilter && (!query || text.includes(query));
+  });
+  container.innerHTML = heroes.length ? heroes.map(heroCard).join('') : `<div class="hero-empty-state">${icon('users')}<h2>ยังไม่พบตัวละครที่ค้นหา</h2><p>ลองค้นหาด้วยชื่อ บทบาท หรือถิ่นกำเนิด</p><button class="button soft" data-action="clear-hero-search">แสดงตัวละครทั้งหมด</button></div>`;
+  $('#hero-result-count').textContent = `แสดง ${heroes.length} จาก ${HEROES.length} ตัวละคร`;
+  document.querySelectorAll('[data-hero-filter]').forEach((button) => {
+    const active = button.dataset.heroFilter === heroFilter;
+    button.classList.toggle('selected', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+function renderHeroes(panel) {
+  const activeHero = getActiveHero(state);
+  const selectable = HEROES.filter((hero) => hero.available).length;
+  const searchFocused = document.activeElement?.id === 'hero-search';
+  const selectionStart = searchFocused ? document.activeElement.selectionStart : null;
+  const previousScroll = panel.scrollTop;
+  panel.innerHTML = `${screenHeader('HEROES OF THE LEGEND', 'วีรชนแห่งตำนาน', 'เลือกผู้กล้าคู่ใจ แล้วนำความสามารถประจำตัวไปเขียนตำนานของคุณ', `<div class="hero-roster-total"><b>${HEROES.length}</b><span>ตัวละคร<br><strong>${selectable} วีรชนพร้อมร่วมทัพ</strong></span></div>`)}
+    <section class="hero-command-summary" data-active-hero="${activeHero.id}" aria-label="วีรชนที่เลือกอยู่">
+      ${portrait(activeHero.id, 'commander-portrait')}
+      <div class="hero-command-copy"><span class="hero-section-label">${icon('check')} วีรชนประจำนคร</span><h2>${esc(activeHero.name)} <small>${esc(activeHero.role || activeHero.title)}</small></h2><p>${esc(activeHero.ability?.description || activeHero.description)}</p>${heroBonusChips(activeHero)}</div>
+      <div class="hero-leadership"><div><span>ระดับผู้นำร่วม</span><b>Lv. ${state.hero.level}</b></div><div class="progress-track"><i style="width:${state.hero.xp / (state.hero.level * 100) * 100}%"></i></div><small>${state.hero.xp} / ${state.hero.level * 100} XP · ${state.hero.points} แต้มคงเหลือ</small><button class="button primary" data-action="hero" data-id="${activeHero.id}">พัฒนาผู้นำ ${icon('arrow')}</button></div>
+    </section>
+    <div class="hero-progression-note">${icon('sparkles')}<p>ระดับ ประสบการณ์ และแต้มพัฒนาผู้นำใช้ร่วมกัน เมื่อเปลี่ยนวีรชน ความคืบหน้าจะยังอยู่ครบ พร้อมเปลี่ยนพลังประจำตัวตามผู้ที่เลือก</p></div>
+    ${state.queues.expedition ? '<div class="hero-roster-travel-lock">กำลังออกสำรวจ — เปลี่ยนวีรชนได้เมื่อกองทัพกลับถึงเมือง</div>' : ''}
+    <div class="hero-roster-toolbar"><div class="hero-filters" aria-label="กรองตัวละคร">${[['all', 'ทั้งหมด', HEROES.length], ['selectable', 'พร้อมร่วมทัพ', selectable], ['lore', 'สมุดตำนาน', HEROES.length - selectable]].map(([value, label, count]) => `<button data-action="filter-heroes" data-hero-filter="${value}" aria-pressed="${heroFilter === value}" class="${heroFilter === value ? 'selected' : ''}">${label}<span>${count}</span></button>`).join('')}</div><label class="hero-search-field">${icon('users')}<span class="visually-hidden">ค้นหาตัวละคร บทบาท หรือถิ่นกำเนิด</span><input id="hero-search" type="search" value="${esc(heroQuery)}" placeholder="ค้นหาตัวละครหรือบทบาท" autocomplete="off"></label></div>
+    <p id="hero-result-count" class="hero-result-count" aria-live="polite"></p><div id="hero-results" class="hero-grid"></div>`;
+  renderHeroResults();
+  panel.scrollTop = previousScroll;
+  if (searchFocused) {
+    const search = $('#hero-search');
+    search.focus({ preventScroll: true });
+    if (selectionStart !== null) search.setSelectionRange(selectionStart, selectionStart);
+  }
+}
 function renderScreen() {
   const panel = $('#screen-panel');
+  panel.classList.toggle('heroes-screen', activeTab === 'heroes');
   if (activeTab === 'army') {
     const queue = state.queues.training;
     panel.innerHTML = `${screenHeader('THE ROYAL ARMY', 'กองทัพแห่งอโยธยา', 'รวบรวมผู้กล้า ฝึกฝนกองทัพ แล้วออกไปเขียนตำนานของคุณ', `<div class="power-pill">${icon('swords')}<div><small>พลังรบทั้งหมด</small><b>${number(getArmyPower(state))}</b></div></div>`)}
@@ -188,8 +266,7 @@ function renderScreen() {
       <div class="troop-grid">${TROOPS.map((troop, index) => { const locked = state.buildings.barracks < troop.unlockBarracks; return `<article class="troop-card"><div class="troop-art troop-art-${index}"><div class="troop-watermark">${icon(troop.icon)}</div><span class="unit-type">${troop.title}</span><span class="unit-count">${number(state.army[troop.id])}<small>นาย</small></span><div class="unit-symbol">${icon(troop.icon)}</div></div><div class="troop-body"><div class="card-title-row"><h2>${troop.name}</h2><span class="tag">${locked ? `ค่ายระดับ ${troop.unlockBarracks}` : 'พร้อมฝึก'}</span></div><p>${troop.description}</p><div class="unit-stats"><span>${icon('swords')} โจมตี <b>${troop.attack}</b></span><span>${icon('shield')} ป้องกัน <b>${troop.defense}</b></span></div>${costs(troop.baseCost)}<button class="button ${locked ? 'soft' : 'primary'} full" data-action="${locked ? 'building' : 'train'}" data-id="${locked ? 'barracks' : troop.id}">${icon(locked ? 'lock' : 'plus')}${locked ? 'พัฒนาค่ายเพื่อปลดล็อก' : 'ฝึกทหาร'}</button></div></article>`; }).join('')}</div>
       <div class="section-callout"><span>${icon('map')} กองทัพพร้อมแล้ว? เลือกจุดหมายแรกบนแผนที่หิมพานต์</span><button class="button soft" data-tab="world">ออกสำรวจ ${icon('arrow')}</button></div>`;
   } else if (activeTab === 'heroes') {
-    panel.innerHTML = `${screenHeader('HEROES OF THE LEGEND', 'วีรชนแห่งตำนาน', 'พลังแห่งศรัทธา ความกล้าหาญ และผู้นำที่คุณเลือกจะเป็น')}
-      <div class="hero-grid">${HEROES.map((hero, index) => `<article class="hero-card ${index === 0 ? 'hero-active' : ''}"><div class="hero-art">${portrait(hero.id)}<span class="hero-faction">${hero.faction}</span>${hero.available ? `<span class="active-hero"><i></i> วีรชนประจำนคร</span>` : '<span class="legend-tag">สมุดภาพตำนาน</span>'}</div><div class="hero-card-info"><div><small>${hero.title}</small><h2>${hero.name}</h2></div>${hero.available ? `<span class="hero-level">Lv. ${state.hero.level}</span>` : icon('sparkles')}</div><p>${hero.description}</p><button class="button ${hero.available ? 'primary' : 'soft'} full" data-action="hero" data-id="${hero.id}">${hero.available ? `พัฒนาวีรชน${state.hero.points > 0 ? ` · ${state.hero.points} แต้ม` : ''}` : 'อ่านเรื่องราว'}${icon('arrow')}</button></article>`).join('')}</div>`;
+    renderHeroes(panel);
   } else if (activeTab === 'quests') {
     panel.innerHTML = `${screenHeader('WRITE YOUR OWN LEGEND', 'เส้นทางแห่งตำนาน', 'ทุกภารกิจคืออีกก้าวของอาณาจักร รับรางวัลแล้วออกเดินทางต่อ', `<div class="quest-total">${icon('trophy')}<b>${state.quests.claimed.length}<span> / ${QUESTS.length}</span></b><small>ภารกิจสำเร็จ</small></div>`)}
       <div class="quest-list">${QUESTS.map((quest, index) => { const p = getQuestProgress(state, quest.id); return `<article class="quest-row ${p.claimed ? 'claimed' : ''} ${!p.unlocked ? 'locked' : ''}"><span class="quest-index">${p.claimed ? icon('check') : String(index + 1).padStart(2, '0')}</span><div class="quest-row-content"><div><span class="eyebrow">CHAPTER ${String(index + 1).padStart(2, '0')}</span><h2>${quest.title}</h2><p>${quest.description}</p></div><div class="quest-row-progress"><div class="progress-track"><i style="width:${p.ratio * 100}%"></i></div><small>${p.current} / ${p.target}</small></div></div><div class="quest-row-reward"><span>${icon('sparkles')} ${quest.xp} XP</span>${costs(quest.reward, true)}</div><button class="button ${p.complete && p.unlocked && !p.claimed ? 'primary' : 'soft'}" data-action="${p.complete ? 'claim' : 'quest-guide'}" data-id="${quest.id}" ${p.claimed || !p.unlocked ? 'disabled' : ''}>${p.claimed ? 'รับรางวัลแล้ว' : !p.unlocked ? `${icon('lock')} ยังไม่ปลดล็อก` : p.complete ? 'รับรางวัล' : `ไปทำภารกิจ ${icon('arrow')}`}</button></article>`; }).join('')}</div>`;
@@ -248,7 +325,13 @@ function renderModal() {
     html = `<div class="expedition-banner"><span>${icon(node.kind === 'forest' ? 'trees' : node.kind === 'mountain' ? 'mountain' : 'city')}</span><div><small>HIMMAPAN EXPEDITION</small><b>ดินแดนที่ ${WORLD_NODES.indexOf(node) + 1}</b></div><span class="tag ${preview.completed ? 'completed-tag' : ''}">${preview.completed ? 'พิชิตแล้ว' : `พลังศัตรู ${node.threat}`}</span></div>${modalHeading('AN ADVENTURE AWAITS', node.name, node.subtitle)}<div class="modal-body"><p>${node.description}</p><label class="field-label" for="expedition-count">กองทัพที่จะส่งไป <b>พร้อม ${getArmySize(state)} นาย</b></label><div class="stepper"><button data-action="count-less" aria-label="ลดจำนวน">${icon('minus')}</button><input id="expedition-count" type="number" min="1" max="${Math.max(1, getArmySize(state))}" value="${modalCount}" inputmode="numeric"><span>นาย</span><button data-action="count-more" aria-label="เพิ่มจำนวน">${icon('plus')}</button></div><input class="troop-range" id="expedition-range" aria-label="เลือกจำนวนกองทัพ" type="range" min="1" max="${Math.max(1, getArmySize(state))}" value="${Math.max(1, modalCount)}"><div id="expedition-preview">${expeditionDetails(preview, node)}</div><button class="button primary full large" id="expedition-confirm" data-action="expedition-confirm" data-id="${id}" ${!preview.available ? 'disabled' : ''}>${icon('flag')} ส่งกองทัพออกเดินทาง</button><p class="action-note" id="expedition-note">${preview.reason || 'ทหารที่รอดชีวิตจะกลับพร้อมทรัพยากรเมื่อจบการเดินทาง'}</p></div>`;
   } else if (type === 'hero') {
     const hero = item(HEROES, id);
-    html = `<div class="hero-modal-art">${portrait(id)}</div>${modalHeading(hero.faction.toUpperCase(), hero.name, hero.title)}<div class="modal-body">${hero.available ? `<div class="hero-xp"><span>ระดับ ${state.hero.level}</span><span>${state.hero.xp} / ${state.hero.level * 100} XP</span></div><div class="progress-track"><i style="width:${state.hero.xp / (state.hero.level * 100) * 100}%"></i></div><div class="points-heading"><h3>ความสามารถวีรชน</h3><span>${state.hero.points} แต้มคงเหลือ</span></div>${[['attack', 'swords', 'พลังโจมตี', '+4.5% พลังทหารต่อแต้ม'], ['defense', 'shield', 'การป้องกัน', 'ลดการสูญเสียกองทัพ'], ['fortune', 'sparkles', 'โชคลาภ', '+3.5% ทรัพยากรต่อแต้ม']].map(([stat, glyph, label, desc]) => `<div class="hero-stat"><span class="stat-icon">${icon(glyph)}</span><div><b>${label}</b><small>${desc}</small></div><strong>${state.hero[stat]}</strong><button class="icon-button" data-action="allocate" data-id="${stat}" aria-label="เพิ่ม${label}" ${state.hero.points < 1 || state.hero[stat] >= 30 ? 'disabled' : ''}>${icon('plus')}</button></div>`).join('')}<p class="action-note">รับประสบการณ์จากการฝึกทหาร ภารกิจ และชัยชนะ</p>` : `<p>${id === 'hanuman' ? 'วานรเผือกผู้เปี่ยมด้วยความกล้าหาญและไหวพริบ ทหารเอกคู่พระรามในวรรณคดีรามเกียรติ์ ผู้ก้าวผ่านอุปสรรคเพื่อภารกิจที่ยิ่งใหญ่กว่า' : 'เจ้าผู้ครองนครลงกา ผู้มีฤทธิ์และอำนาจอันยิ่งใหญ่ ในแคมเปญนี้ นครลงกาคือจุดหมายสุดท้ายของเส้นทางผู้พิทักษ์'}</p><div class="notice">วีรชนนี้เป็นสมุดภาพตำนานในเวอร์ชันปัจจุบัน วีรชนที่พัฒนาความสามารถได้คือพระราม</div>`}</div>`;
+    const active = getActiveHero(state).id === id;
+    const bonuses = active ? getHeroBonuses(state) : hero.bonuses || {};
+    const effective = getEffectiveHeroStats(state);
+    const status = active ? 'วีรชนประจำนคร' : hero.available ? 'พร้อมร่วมทัพ' : 'สมุดภาพตำนาน';
+    const ability = hero.available ? `<section class="hero-ability-panel"><span class="hero-section-label">${icon('sparkles')} ความสามารถประจำตัว</span><h3>${esc(hero.ability?.name || 'พลังแห่งผู้นำ')}</h3><p>${esc(hero.ability?.description || hero.description)}</p>${heroBonusChips(hero)}<small>พลังประจำตัวจะรวมกับแต้มพัฒนาผู้นำเมื่อเลือกวีรชนนี้</small></section>` : '';
+    const development = active ? `<section class="hero-development"><div class="hero-xp"><span>ระดับผู้นำร่วม <b>Lv. ${state.hero.level}</b></span><span>${state.hero.xp} / ${state.hero.level * 100} XP</span></div><div class="progress-track"><i style="width:${state.hero.xp / (state.hero.level * 100) * 100}%"></i></div><div class="points-heading"><h3>แต้มพัฒนาผู้นำ</h3><span>${state.hero.points} แต้มคงเหลือ</span></div>${[['attack', 'swords', 'พลังโจมตี', '+4.5% พลังทหารต่อแต้ม'], ['defense', 'shield', 'การป้องกัน', 'ลดการสูญเสียกองทัพ'], ['fortune', 'sparkles', 'โชคลาภ', '+3.5% ทรัพยากรต่อแต้ม']].map(([stat, glyph, label, desc]) => `<div class="hero-stat"><span class="stat-icon">${icon(glyph)}</span><div><b>${label}</b><small>${desc}</small><span class="hero-stat-breakdown">พัฒนา ${state.hero[stat]} · ประจำตัว +${Number(bonuses[stat]) || 0}</span></div><strong data-effective-stat="${stat}" aria-label="${label}รวม ${effective[stat]}">${effective[stat]}</strong><button class="icon-button" data-action="allocate" data-id="${stat}" aria-label="เพิ่ม${label}" ${state.hero.points < 1 || state.hero[stat] >= 30 ? 'disabled' : ''}>${icon('plus')}</button></div>`).join('')}<p class="hero-shared-note">รับ XP จากการฝึกทหาร ภารกิจ และชัยชนะ ระดับและแต้มที่พัฒนาแล้วคงอยู่เมื่อเปลี่ยนวีรชน</p></section>` : hero.available ? `<div class="hero-shared-preview"><span>${icon('crown')} ใช้ระดับผู้นำร่วม <b>Lv. ${state.hero.level}</b></span><p>คงประสบการณ์ ${state.hero.xp} XP และแต้มพัฒนาทั้งหมดของคุณ แล้วเปลี่ยนพลังประจำตัวเป็นของ${esc(hero.name)}</p></div><button class="button primary full large" data-action="select-hero" data-id="${hero.id}" ${state.queues.expedition ? 'disabled' : ''}>${icon('crown')} เลือก${esc(hero.name)}ประจำนคร</button>${state.queues.expedition ? '<p class="hero-travel-lock">กองทัพกำลังออกสำรวจ เปลี่ยนวีรชนได้เมื่อกองทัพกลับถึงเมือง</p>' : '<p class="hero-shared-note">เปลี่ยนได้โดยไม่ใช้ทรัพยากร ความคืบหน้าผู้นำจะยังอยู่ครบ</p>'}` : '<div class="notice hero-lore-notice">ตัวละครนี้อยู่ในสมุดภาพตำนาน เปิดอ่านเรื่องราวได้ แต่ยังไม่สามารถเลือกประจำนครได้</div>';
+    html = `<div class="hero-modal-art">${portrait(id, 'portrait-dialog')}<span class="hero-modal-status">${active ? icon('check') : icon(hero.available ? 'crown' : 'scroll')}${status}</span></div>${modalHeading(esc(hero.faction), esc(hero.name), esc(hero.role || hero.title))}<div class="modal-body"><p class="hero-lore-copy">${esc(hero.lore || hero.description)}</p>${ability}${development}</div>`;
   } else if (type === 'reports') {
     html = `${modalHeading('KINGDOM CHRONICLES', 'บันทึกอาณาจักร', 'ทุกก้าวเล็ก ๆ ของเมืองและกองทัพของคุณ')}<div class="modal-body reports-body">${state.events.length ? state.events.map((event) => `<article class="report-entry"><span class="report-symbol ${event.kind}">${icon(event.kind === 'victory' || event.kind === 'campaign' ? 'trophy' : event.kind === 'building' ? 'hammer' : event.kind === 'training' ? 'swords' : event.kind === 'defeat' ? 'shield' : 'sparkles')}</span><div><small>${new Date(event.at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })}</small><h3>${esc(event.title)}</h3><p>${esc(event.message)}</p>${event.rewards ? costs(event.rewards, true) : ''}</div></article>`).join('') : `<div class="empty-state">${icon('scroll')}<h3>หน้าแรกของตำนานยังว่างอยู่</h3><p>เริ่มพัฒนาเมืองหรือออกสำรวจ แล้วเรื่องราวจะปรากฏที่นี่</p><button class="button primary" data-action="start-building">เริ่มพัฒนาเมือง ${icon('arrow')}</button></div>`}</div>`;
   } else if (type === 'settings') {
@@ -275,6 +358,11 @@ function renderModal() {
     const candidates = [...$('#game-dialog').querySelectorAll('button, input')];
     const replacement = candidates.find((element) => focusedId ? element.id === focusedId : focusedAction && element.dataset.action === focusedAction && element.dataset.id === focusedItem);
     if (replacement && !replacement.disabled) replacement.focus({ preventScroll: true });
+    else if (type === 'hero') {
+      const heading = $('#modal-title');
+      heading.tabIndex = -1;
+      heading.focus({ preventScroll: true });
+    }
   }
 }
 function expeditionDetails(preview, node) {
@@ -383,7 +471,21 @@ document.addEventListener('click', (event) => {
     const count = modalCount;
     perform(() => sendExpedition(state, id, count), { close: true });
   }
-  else if (action === 'allocate') perform(() => allocateHeroPoint(state, id));
+  else if (action === 'select-hero') perform(() => selectHero(state, id));
+  else if (action === 'allocate') {
+    if (modal?.type === 'hero' && modal.id === getActiveHero(state).id) perform(() => allocateHeroPoint(state, id));
+  }
+  else if (action === 'filter-heroes') {
+    heroFilter = ['all', 'selectable', 'lore'].includes(button.dataset.heroFilter) ? button.dataset.heroFilter : 'all';
+    renderHeroResults();
+  }
+  else if (action === 'clear-hero-search') {
+    heroQuery = '';
+    heroFilter = 'all';
+    if ($('#hero-search')) $('#hero-search').value = '';
+    renderHeroResults();
+    $('#hero-search')?.focus({ preventScroll: true });
+  }
   else if (action === 'claim') perform(() => claimQuest(state, id));
   else if (action === 'quest-guide') questGuide(id);
   else if (action === 'count-less') updateCount(modalCount - 1);
@@ -453,6 +555,10 @@ document.addEventListener('click', (event) => {
 });
 document.addEventListener('input', (event) => {
   if (['troop-count', 'expedition-count', 'expedition-range'].includes(event.target.id)) updateCount(event.target.value);
+  else if (event.target.id === 'hero-search') {
+    heroQuery = event.target.value.slice(0, 120);
+    renderHeroResults();
+  }
 });
 $('#restore-file').addEventListener('change', async (event) => {
   const file = event.target.files?.[0];
