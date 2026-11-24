@@ -77,8 +77,34 @@ export function createVillage(container, { onSelect = () => {}, onReady = () => 
   let night = false;
   let frameId = 0;
   let lastFrame = 0;
+  let dirty = true;
+  let renderedFrames = 0;
+  let constructionId = null;
   let renderer;
   let fallback = null;
+
+  function scheduleFrame() {
+    if (!destroyed && !frameId && renderer && mode === 'city' && !document.hidden && container.isConnected) {
+      frameId = requestAnimationFrame(render);
+    }
+  }
+  function invalidate() {
+    dirty = true;
+    scheduleFrame();
+  }
+  function stopFrames() {
+    if (frameId) cancelAnimationFrame(frameId);
+    frameId = 0;
+  }
+  function onVisibilityChange() {
+    if (document.hidden) {
+      dirty = true;
+      stopFrames();
+    } else {
+      lastFrame = 0;
+      invalidate();
+    }
+  }
 
   const mat = (color, extra = {}) => {
     const key = JSON.stringify([color, extra]);
@@ -616,6 +642,8 @@ export function createVillage(container, { onSelect = () => {}, onReady = () => 
     });container.appendChild(fallback);
     console.warn('RAMA: 3D renderer unavailable; accessible building controls remain available.',error?.message);
   }
+  controls?.addEventListener('change', invalidate);
+  document.addEventListener('visibilitychange', onVisibilityChange);
 
   const raycaster=new THREE.Raycaster();const pointer=new THREE.Vector2();let pointerStart=null;
   function onPointerDown(event){if(event.isPrimary&&event.button===0)pointerStart={x:event.clientX,y:event.clientY};}
@@ -631,6 +659,7 @@ export function createVillage(container, { onSelect = () => {}, onReady = () => 
   renderer?.domElement.addEventListener('pointerdown',onPointerDown);
   renderer?.domElement.addEventListener('pointerup',onPointerUp);
   renderer?.domElement.addEventListener('pointercancel',onPointerCancel);
+  renderer?.domElement.addEventListener('webglcontextrestored',invalidate);
   const projected=new THREE.Vector3();
   let width=1,height=1;
   function positionLabels(){
@@ -646,10 +675,15 @@ export function createVillage(container, { onSelect = () => {}, onReady = () => 
   }
   function resize(){
     if(destroyed)return;
-    width=container.clientWidth||1;height=container.clientHeight||1;
+    const nextWidth=container.clientWidth,nextHeight=container.clientHeight;
+    // Hidden tabs keep their last framebuffer; returning to the city explicitly
+    // resizes it. Avoid allocating a 1x1 buffer just to immediately replace it.
+    if(nextWidth<=0||nextHeight<=0)return;
+    const sizeChanged=nextWidth!==width||nextHeight!==height;
+    width=nextWidth;height=nextHeight;
     const aspect=width/height;const viewHeight=Math.max(25,32.8/aspect);
     camera.left=-viewHeight*aspect/2;camera.right=viewHeight*aspect/2;camera.top=viewHeight/2;camera.bottom=-viewHeight/2;
-    camera.updateProjectionMatrix();renderer?.setSize(width,height,false);positionLabels();
+    camera.updateProjectionMatrix();if(sizeChanged)renderer?.setSize(width,height,false);positionLabels();invalidate();
   }
   const resizeObserver=new ResizeObserver(resize);resizeObserver.observe(container);
   function getConstruction(){
@@ -667,29 +701,52 @@ export function createVillage(container, { onSelect = () => {}, onReady = () => 
       const finish=queue?.endsAt||queue?.endAt||queue?.finishAt||queue?.completesAt;
       button.querySelector('.marker-timer').textContent=buildingId===id&&finish?`${Math.max(0,Math.ceil((finish-Date.now())/1000))}s`:'';
     }
-    buildRing.visible=Boolean(buildingId&&LOTS[buildingId]);
-    if(buildRing.visible)buildRing.position.set(LOTS[buildingId].x,.228,LOTS[buildingId].z);
+    const nextConstructionId=buildingId&&LOTS[buildingId]?buildingId:null;
+    // Resource/countdown ticks change DOM labels, not the static WebGL scene.
+    if(nextConstructionId!==constructionId){
+      constructionId=nextConstructionId;
+      buildRing.visible=Boolean(constructionId);
+      if(buildRing.visible)buildRing.position.set(LOTS[constructionId].x,.228,LOTS[constructionId].z);
+      invalidate();
+    }
   }
   function setSelected(id){
-    selected=LOTS[id]?id:null;
+    const nextSelected=LOTS[id]?id:null;
+    const changed=nextSelected!==selected;
+    selected=nextSelected;
     labels.forEach((button,key)=>button.classList.toggle('is-selected',key===selected));
     ring.visible=!!selected;if(selected){const lot=LOTS[selected];ring.position.set(lot.x,.225,lot.z);const scale=selected==='palace'?1.5:1;ring.scale.setScalar(scale);}
+    if(changed)invalidate();
   }
-  function setMode(next){mode=next;labelLayer.style.display=next==='city'&&!fallback?'':'none';}
+  function setMode(next){
+    const changed=next!==mode;
+    mode=next;labelLayer.style.display=next==='city'&&!fallback?'':'none';
+    if(mode!=='city')stopFrames();
+    if(changed)invalidate();
+  }
   function setNight(value){
+    const changed=night!==!!value;
     night=!!value;ambient.intensity=night?.9:2.15;ambient.color.set(night?'#8ea4ba':'#fff3d9');sun.intensity=night?1.15:3.5;sun.color.set(night?'#b6cadb':'#fff1d3');fill.intensity=night?.45:.75;
     lanterns.forEach(lamp=>{lamp.material.emissiveIntensity=night?2.2:.1;});
     if(renderer)renderer.toneMappingExposure=night?.94:1.16;
+    if(changed)invalidate();
   }
-  function zoom(delta){camera.zoom=THREE.MathUtils.clamp(camera.zoom+delta,.75,2.6);camera.updateProjectionMatrix();controls?.update();positionLabels();}
+  function zoom(delta){camera.zoom=THREE.MathUtils.clamp(camera.zoom+delta,.75,2.6);camera.updateProjectionMatrix();controls?.update();positionLabels();invalidate();}
   function resetCamera(){camera.position.set(31,29,35);camera.zoom=1;controls?.target.set(0,.5,0);camera.lookAt(0,.5,0);controls?.update();resize();}
   function render(time){
-    if(destroyed)return;frameId=requestAnimationFrame(render);
-    // 30 FPS is enough for a calm city and avoids burning a mobile battery.
-    if(time-lastFrame<32||mode!=='city'||!renderer||!container.isConnected)return;lastFrame=time;
-    controls?.update();
+    frameId=0;
+    if(destroyed||document.hidden||mode!=='city'||!renderer||!container.isConnected)return;
+    // Animation remains capped at 30 FPS. Reduced motion draws only on changes,
+    // so an idle city does not continuously enqueue identical shadow-map frames.
+    if(time-lastFrame<32){scheduleFrame();return;}
     // Keep panning bounded so that the town cannot be lost off-screen.
     if(controls){controls.target.x=THREE.MathUtils.clamp(controls.target.x,-7,7);controls.target.z=THREE.MathUtils.clamp(controls.target.z,-6,6);}
+    // Damping must advance before the dirty check. Its change event requests the
+    // next frame until the camera settles, then the reduced-motion loop sleeps.
+    const cameraChanged=controls?.update()===true;
+    if(cameraChanged)dirty=true;
+    if(reducedMotion&&!dirty)return;
+    lastFrame=time;
     if(!reducedMotion){
       const t=time*.001;
       movers.forEach(({mesh:person,x,z,index})=>{
@@ -698,17 +755,22 @@ export function createVillage(container, { onSelect = () => {}, onReady = () => 
       smoke.forEach(({mesh:puff,base,index})=>{puff.position.y=base+Math.sin(t*.8+index)*.09;puff.position.x=.72+Math.sin(t*.5+index)*.09;});
       if(buildRing.visible){buildRing.material.opacity=.43+Math.sin(t*3)*.16;buildRing.rotation.z=t*.15;}
     }
-    renderer.render(scene,camera);positionLabels();
+    dirty=false;
+    renderer.render(scene,camera);renderedFrames+=1;positionLabels();
+    if(!reducedMotion||cameraChanged)scheduleFrame();
   }
-  resize();frameId=requestAnimationFrame(render);
+  resize();
   queueMicrotask(()=>{if(!destroyed)onReady({webgl:!!renderer});});
 
   return {
     setState,setSelected,setMode,setNight,zoom,resetCamera,resize,
-    getDiagnostics:()=>({webgl:!!renderer,mode,night,selected,buildings:Object.keys(LOTS).length,drawCalls:renderer?.info.render.calls||0,triangles:renderer?.info.render.triangles||0,geometries:renderer?.info.memory.geometries||0,pixelRatio:renderer?.getPixelRatio()||0}),
+    getDiagnostics:()=>({webgl:!!renderer,mode,night,selected,buildings:Object.keys(LOTS).length,drawCalls:renderer?.info.render.calls||0,triangles:renderer?.info.render.triangles||0,geometries:renderer?.info.memory.geometries||0,pixelRatio:renderer?.getPixelRatio()||0,renderedFrames,reducedMotion:!!reducedMotion}),
     destroy(){
-      destroyed=true;cancelAnimationFrame(frameId);resizeObserver.disconnect();controls?.dispose();
+      destroyed=true;stopFrames();resizeObserver.disconnect();
+      document.removeEventListener('visibilitychange',onVisibilityChange);
+      controls?.removeEventListener('change',invalidate);controls?.dispose();
       renderer?.domElement.removeEventListener('pointerdown',onPointerDown);renderer?.domElement.removeEventListener('pointerup',onPointerUp);renderer?.domElement.removeEventListener('pointercancel',onPointerCancel);
+      renderer?.domElement.removeEventListener('webglcontextrestored',invalidate);
       const disposed=new Set();scene.traverse(object=>{if(object.geometry&&!disposed.has(object.geometry)){object.geometry.dispose();disposed.add(object.geometry);}if(object.material){const list=Array.isArray(object.material)?object.material:[object.material];list.forEach(material=>{if(!disposed.has(material)){material.dispose();disposed.add(material);}});}});
       materials.forEach(material=>{if(!disposed.has(material))material.dispose();});geometryCache.forEach(geometry=>geometry.dispose());
       retiredGeometries.forEach(geometry=>{if(!disposed.has(geometry))geometry.dispose();});

@@ -280,6 +280,16 @@ try {
     await navigate(desktop);
     report.desktopDiagnostics = await desktop.evaluate(() => window.rama.getDiagnostics());
     await capture(desktop, 'desktop-city.png');
+    // Font loading, the initial resize and screenshot have settled. Reduced
+    // motion must now leave the unchanged WebGL city idle on the real clock.
+    const beforeIdle = await desktop.evaluate(() => window.rama.getDiagnostics());
+    assert.equal(beforeIdle.reducedMotion, true, 'This context must exercise the reduced-motion renderer.');
+    assert(Number.isInteger(beforeIdle.renderedFrames) && beforeIdle.renderedFrames > 0, 'A rendered frame count is required for the idle regression check.');
+    const idleStartedAt = Date.now();
+    await delay(400);
+    const afterIdle = await desktop.evaluate(() => window.rama.getDiagnostics());
+    report.reducedMotionRendering = { idle: { before: beforeIdle.renderedFrames, after: afterIdle.renderedFrames, elapsedMs: Date.now() - idleStartedAt } };
+    assert.equal(afterIdle.renderedFrames, beforeIdle.renderedFrames, 'An unchanged city must not keep drawing WebGL frames with reduced motion enabled.');
   });
 
   await step('Upgrade the sawmill by selecting its city marker', async () => {
@@ -427,12 +437,24 @@ try {
   });
 
   await step('Day and night update both the interface and the 3D scene', async () => {
+    const beforeNight = await desktop.evaluate(() => window.rama.getDiagnostics().renderedFrames);
     await desktop.locator('.weather-button').click();
     assert(await desktop.locator('body').evaluate((element) => element.classList.contains('night-mode')));
     assert.equal(await desktop.evaluate(() => window.rama.getDiagnostics().night), true);
+    await desktop.waitForFunction((before) => {
+      const diagnostics = window.rama.getDiagnostics();
+      return diagnostics.night && diagnostics.renderedFrames > before;
+    }, beforeNight, { timeout: 15_000 });
+    const nightFrames = await desktop.evaluate(() => window.rama.getDiagnostics().renderedFrames);
     await capture(desktop, 'desktop-night.png');
+    const beforeDay = await desktop.evaluate(() => window.rama.getDiagnostics().renderedFrames);
     await desktop.locator('.weather-button').click();
     assert.equal(await desktop.evaluate(() => window.rama.getDiagnostics().night), false);
+    await desktop.waitForFunction((before) => {
+      const diagnostics = window.rama.getDiagnostics();
+      return !diagnostics.night && diagnostics.renderedFrames > before;
+    }, beforeDay, { timeout: 15_000 });
+    report.reducedMotionRendering.dayNight = { beforeNight, nightFrames, beforeDay, dayFrames: await desktop.evaluate(() => window.rama.getDiagnostics().renderedFrames) };
   });
 
   await step('Render the saved city at 390 × 844 with touch controls', async () => {

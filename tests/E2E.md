@@ -28,6 +28,9 @@ and loaded fonts. The smoke does not use `networkidle` as a readiness proxy.
 - The real Three.js scene renders at desktop **1440 × 1000** and mobile
   **390 × 844**, has draw calls and triangles, and exposes all nine map markers.
   The accessible non-WebGL fallback deliberately **fails** this particular test.
+- With reduced motion enabled, the settled desktop city draws no additional
+  WebGL frames during a **400 ms real-time** idle interval. Its existing rendered
+  scene remains visible, and the check records both frame counts.
 - Selecting the sawmill marker opens its modal. The upgrade spends resources,
   waits for its timer, completes, and restores focus when dismissed with Escape.
 - The training UI creates three guardians and three archers after their timers.
@@ -49,7 +52,9 @@ and loaded fonts. The smoke does not use `networkidle` as a readiness proxy.
   uploading that actual downloaded file previews the saved kingdom and restores
   its name and progress only after confirmation. Malformed JSON shows an error
   and leaves the current city and progression unchanged.
-- Day/night controls affect both the interface and the 3D scene.
+- Day/night controls affect both the interface and the 3D scene. Each toggle
+  must increase the actual rendered-frame count before its result is accepted;
+  changing the night flag without redrawing cannot pass.
 - Mobile touch opens building and expedition dialogs without horizontal overflow
   or dialog boundaries extending outside the viewport.
 - Mobile can open the expanded roster and Sita's portrait modal, select her by
@@ -90,7 +95,8 @@ events, and a bounded runtime probe to distinguish a navigation stall from an
 application initialization failure. It also captures
 desktop city, world, heroes, night, mobile city and mobile building, expedition and
 hero dialog screenshots. Hero roster, atlas decoding and selection outcomes are
-also recorded in the report.
+also recorded in the report, along with reduced-motion idle and day/night frame
+counts.
 The backup round trip also retains the real downloaded `exported-backup.json`.
 Failures after browser startup additionally capture `failure.png`.
 
