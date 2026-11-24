@@ -83,7 +83,7 @@ npm run build
 
 ### GitHub Actions
 
-Workflow **CI** ทำงานเมื่อ push เข้า `main` หรือเปิด/อัปเดต pull request โดยติดตั้งจาก lockfile รัน `npm test` และ `npm run build` แล้วเก็บ `dist/` เป็น artifact ชื่อ `rama-dist-<commit>` นาน 7 วัน ขั้นตอนนี้ไม่เผยแพร่เว็บไซต์
+Workflow **CI** ทำงานเมื่อ push เข้า `main` หรือเปิด/อัปเดต pull request โดยติดตั้งจาก lockfile รัน `npm test`, `npm run build` และทดสอบการเล่นบน Chromium ที่ขนาด desktop/mobile ด้วย `npm run test:e2e` พร้อมเก็บภาพและรายงานใน artifact `rama-browser-<commit>` แล้วเก็บ `dist/` เป็น artifact ชื่อ `rama-dist-<commit>` นาน 7 วัน ขั้นตอนนี้ไม่เผยแพร่เว็บไซต์
 
 Workflow **Deploy GitHub Pages (manual)** เตรียมไว้สำหรับผู้ดูแลที่ต้องการเผยแพร่:
 
@@ -105,7 +105,7 @@ Workflow นี้มีเฉพาะ `workflow_dispatch`; การ push โ�
 | `src/render/world-map.js` | แผนที่โลก SVG การเลือกพื้นที่ และเส้นทางเดินทัพ |
 | `src/ui/icons.js` | ไอคอน SVG สำหรับ UI |
 | `src/ui/audio.js` | เสียงประกอบผ่าน Web Audio |
-| `public/art/hero-atlas.png` | ภาพวีรชนที่สร้างใหม่สำหรับโครงการ |
+| `public/art/hero-atlas.webp` | ภาพวีรชนที่สร้างใหม่สำหรับโครงการ |
 | `tests/engine.test.js` | ชุดทดสอบกติกาและความถูกต้องของเซฟ |
 | `docs/GAME_DESIGN.md` | แนวเกม ขอบเขต และค่าบาลานซ์ |
 | `docs/ASSET_PROVENANCE.md` | แหล่งที่มาและข้อมูลภาพ/ฟอนต์ |

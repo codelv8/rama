@@ -209,13 +209,17 @@ function closeModal() {
   pendingRestore = null;
   village?.setSelected(null);
   world?.setSelected(null);
-  lastFocus?.focus?.({ preventScroll: true });
+  (lastFocus?.isConnected ? lastFocus : $('.nav-item.active'))?.focus?.({ preventScroll: true });
 }
 function modalHeading(eyebrow, title, subtitle = '') {
   return `<button class="icon-button modal-close" data-action="close" aria-label="ปิดหน้าต่าง">${icon('close')}</button><div class="modal-heading"><span class="eyebrow">${eyebrow}</span><h2 id="modal-title">${title}</h2>${subtitle ? `<p>${subtitle}</p>` : ''}</div>`;
 }
 function renderModal() {
   if (!modal) return;
+  const focused = $('#game-dialog').contains(document.activeElement) ? document.activeElement : null;
+  const focusedId = focused?.id;
+  const focusedAction = focused?.dataset?.action;
+  const focusedItem = focused?.dataset?.id;
   const { type, id } = modal;
   let html = '';
   if (type === 'building') {
@@ -262,6 +266,11 @@ function renderModal() {
     restore.dataset.action = 'restore-pick';
     restore.innerHTML = `${icon('save')} กู้คืนความคืบหน้าจากไฟล์`;
     $('[data-action="export"]').after(restore);
+  }
+  if ($('#game-dialog').open && focused) {
+    const candidates = [...$('#game-dialog').querySelectorAll('button, input')];
+    const replacement = candidates.find((element) => focusedId ? element.id === focusedId : focusedAction && element.dataset.action === focusedAction && element.dataset.id === focusedItem);
+    if (replacement && !replacement.disabled) replacement.focus({ preventScroll: true });
   }
 }
 function expeditionDetails(preview, node) {

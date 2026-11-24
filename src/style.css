@@ -436,6 +436,9 @@
   .save-notice p { color: #a1ad91; font-size: 9px; line-height: 1.8; margin-top: 5px; }
   .settings-divider { height: 1px; background: #e9eddd; margin: 22px 0 13px; }
   .version-note { margin-top: 10px !important; font-size: 9px !important; color: #bdc2ac !important; }
+  .restore-summary { padding: 17px; background: #edf2e1; border: 1px solid #dfe8cf; border-radius: 9px; margin-bottom: 18px; }
+  .restore-summary > b { font-size: 18px; font-weight: 500; }
+  .restore-summary > p { margin-top: 7px; font-size: 10px; color: #8c9e77; line-height: 1.8; }
   .button-row { display: flex; justify-content: flex-end; gap: 10px; margin-top: 25px; }
   .danger-button { color: #fffaf3; background: #b46850; }
   .help-step { display: flex; gap: 16px; margin: 16px 0 25px; }

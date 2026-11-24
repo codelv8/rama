@@ -28,6 +28,10 @@ uses its installed Chromium. Software WebGL is enabled for headless CI.
   returns survivors, loot, a completed destination, and a victory report.
 - Construction, recruitment and victory quests can be claimed in sequence.
 - Reloading preserves buildings, army, hero, completed destinations and rewards.
+- Exporting downloads a valid backup. After renaming the city through settings,
+  uploading that actual downloaded file previews the saved kingdom and restores
+  its name and progress only after confirmation. Malformed JSON shows an error
+  and leaves the current city and progression unchanged.
 - Day/night controls affect both the interface and the 3D scene.
 - Mobile touch opens building and expedition dialogs without horizontal overflow
   or dialog boundaries extending outside the viewport.
@@ -43,12 +47,16 @@ normal browser storage snapshot.
 Playwright's browser clock advances construction, training and expedition time.
 The application still processes its own interval and persistence logic. This
 keeps the smoke run short without replacing the game simulation.
+Before screenshots the clock resumes and two app animation frames complete.
+Screenshots use a bounded 30-second compositor timeout; they do not cancel CSS
+animations on top of the context's existing reduced-motion preference.
 
 ## Evidence and limitations
 
 `test-results/` is ignored by Git. Each run writes `smoke-report.json` with step
 results, viewport sizes, render diagnostics and error details. It also captures
 desktop city, world, heroes, night, mobile city and mobile dialog screenshots.
+The backup round trip also retains the real downloaded `exported-backup.json`.
 Failures after browser startup additionally capture `failure.png`.
 
 A syntax check, an engine test pass, or a successful production build does **not**

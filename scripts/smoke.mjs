@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -82,8 +82,14 @@ async function clearToasts(page) {
 }
 
 async function capture(page, filename) {
+  // Timed gameplay uses fastForward. Give the app two live frame callbacks
+  // after explicitly resuming before asking Chromium's compositor to capture.
+  // reducedMotion is already enabled on the context; screenshot animation
+  // cancellation is unnecessary and can interfere with clock-driven frames.
+  await page.clock.resume();
   await clearToasts(page);
-  await page.screenshot({ path: join(output, filename), fullPage: true, animations: 'disabled' });
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await page.screenshot({ path: join(output, filename), fullPage: true, timeout: 30_000 });
   report.screenshots.push(filename);
 }
 
@@ -243,6 +249,48 @@ try {
     report.persistedProgress = { buildings: after.buildings, army: after.army, hero: after.hero, completedNodes: after.completedNodes, claimedQuests: after.quests.claimed };
   });
 
+  await step('Export a real backup, restore it after renaming, and reject malformed JSON', async () => {
+    const coreFields = ['buildings', 'army', 'hero', 'completedNodes', 'quests', 'campaignWon'];
+    const before = await snapshot(desktop);
+    await desktop.locator('.player-button[data-action="settings"]').click();
+    const downloadPending = desktop.waitForEvent('download');
+    await desktop.locator('[data-action="export"]').click();
+    const download = await downloadPending;
+    assert.match(download.suggestedFilename(), /^rama-save-\d{4}-\d{2}-\d{2}\.json$/);
+    const backupPath = join(output, 'exported-backup.json');
+    await download.saveAs(backupPath);
+    assert.equal(await download.failure(), null, 'The backup download must complete.');
+    const backup = JSON.parse(await readFile(backupPath, 'utf8'));
+    assert.equal(backup.version, 1);
+    assert.equal(backup.cityName, before.cityName);
+    for (const key of coreFields) assert.deepEqual(backup[key], before[key], `The exported backup lost ${key}.`);
+
+    const renamedCity = 'นครทดสอบไฟล์สำรอง';
+    await desktop.locator('#city-name-input').fill(renamedCity);
+    await desktop.locator('[data-action="rename"]').click();
+    assert.equal((await snapshot(desktop)).cityName, renamedCity, 'The rename must happen through the settings UI.');
+    await desktop.locator('#restore-file').setInputFiles(backupPath);
+    await desktop.locator('[data-action="restore-confirm"]').waitFor({ state: 'visible' });
+    assert.equal(await desktop.locator('.restore-summary b').textContent(), backup.cityName, 'The confirmation must identify the uploaded kingdom.');
+    assert.equal((await snapshot(desktop)).cityName, renamedCity, 'Selecting a backup must not restore it before confirmation.');
+    await desktop.locator('[data-action="restore-confirm"]').click();
+    const restored = await snapshot(desktop);
+    assert.equal(restored.cityName, backup.cityName);
+    for (const key of coreFields) assert.deepEqual(restored[key], backup[key], `Restoring the downloaded backup lost ${key}.`);
+    assert.equal(await desktop.locator('.city-name').textContent(), backup.cityName, 'The visible city name must refresh after restore.');
+
+    await desktop.locator('.player-button[data-action="settings"]').click();
+    const beforeInvalid = await snapshot(desktop);
+    await desktop.locator('#restore-file').setInputFiles({ name: 'invalid-rama-backup.json', mimeType: 'application/json', buffer: Buffer.from('{"version":') });
+    await desktop.getByText('ไฟล์นี้ไม่ใช่ไฟล์สำรอง RAMA ที่รองรับ', { exact: true }).waitFor({ state: 'visible' });
+    const afterInvalid = await snapshot(desktop);
+    assert.equal(afterInvalid.cityName, beforeInvalid.cityName, 'Malformed JSON must not replace the current city.');
+    for (const key of coreFields) assert.deepEqual(afterInvalid[key], beforeInvalid[key], `Malformed JSON unexpectedly changed ${key}.`);
+    assert.equal(await desktop.locator('[data-action="restore-confirm"]').count(), 0, 'Malformed JSON must never reach the restore confirmation.');
+    await closeDialog(desktop);
+    report.backupRoundTrip = { filename: download.suggestedFilename(), restoredCity: restored.cityName, malformedJsonRejected: true };
+  });
+
   await step('Day and night update both the interface and the 3D scene', async () => {
     await desktop.locator('.weather-button').click();
     assert(await desktop.locator('body').evaluate((element) => element.classList.contains('night-mode')));
@@ -291,7 +339,8 @@ try {
   report.failure = { message: error.message, stack: error.stack };
   const page = mobile && !mobile.isClosed() ? mobile : desktop && !desktop.isClosed() ? desktop : null;
   if (page) {
-    await page.screenshot({ path: join(output, 'failure.png'), fullPage: true, animations: 'disabled' }).catch(() => {});
+    await page.clock.resume().catch(() => {});
+    await page.screenshot({ path: join(output, 'failure.png'), fullPage: true, timeout: 30_000 }).catch(() => {});
     report.failure.diagnostics = await page.evaluate(() => window.rama?.getDiagnostics()).catch(() => null);
   }
   if (!browser) report.failure.serverOutput = serverOutput;
