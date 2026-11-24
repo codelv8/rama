@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -14,15 +14,40 @@ const port = Number(process.env.RAMA_SMOKE_PORT || 4178);
 assert(Number.isInteger(port) && port >= 1024 && port <= 65535, 'RAMA_SMOKE_PORT must be an integer from 1024 to 65535.');
 const origin = `http://127.0.0.1:${port}`;
 const requiredScreenshots = ['desktop-city.png', 'desktop-heroes.png', 'desktop-world.png', 'desktop-night.png', 'mobile-city.png', 'mobile-building-dialog.png', 'mobile-expedition-dialog.png'];
-const report = { status: 'running', timing: 'real-time', startedAt: new Date().toISOString(), viewports: { desktop: { width: 1440, height: 1000 }, mobile: { width: 390, height: 844 } }, steps: [], queueWaits: [], screenshots: [], captureAttempts: [], errors: [] };
+const report = { status: 'running', target: 'production-preview', timing: 'real-time', startedAt: new Date().toISOString(), viewports: { desktop: { width: 1440, height: 1000 }, mobile: { width: 390, height: 844 } }, steps: [], navigations: [], queueWaits: [], screenshots: [], captureAttempts: [], errors: [] };
 let browser;
 let server;
 let desktop;
 let mobile;
 let serverOutput = '';
 let serverError;
+let shuttingDown = false;
+const pageObservations = new Map();
 
 function observeErrors(page, device) {
+  const observation = { device, recent: [], pending: new Map() };
+  pageObservations.set(page, observation);
+  const remember = (event) => {
+    observation.recent.push({ at: new Date().toISOString(), ...event });
+    if (observation.recent.length > 35) observation.recent.shift();
+  };
+  page.on('request', (request) => {
+    if (request.url().startsWith(origin)) observation.pending.set(request, { path: new URL(request.url()).pathname, type: request.resourceType(), startedAt: Date.now() });
+  });
+  const requestEnded = (request, failed = false) => {
+    const pending = observation.pending.get(request);
+    if (pending) remember({ event: failed ? 'requestfailed' : 'requestfinished', path: pending.path, type: pending.type, durationMs: Date.now() - pending.startedAt });
+    observation.pending.delete(request);
+  };
+  page.on('requestfinished', (request) => requestEnded(request));
+  page.on('domcontentloaded', () => remember({ event: 'domcontentloaded' }));
+  page.on('load', () => remember({ event: 'load' }));
+  page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) remember({ event: 'navigation', url: frame.url() }); });
+  page.on('crash', () => {
+    remember({ event: 'crash' });
+    report.errors.push({ device, type: 'pagecrash', message: 'Chromium page crashed.' });
+  });
+  page.on('close', () => remember({ event: 'close' }));
   page.on('pageerror', (error) => report.errors.push({ device, type: 'pageerror', message: error.message }));
   page.on('console', (message) => {
     if (message.type() === 'error') report.errors.push({ device, type: 'console', message: message.text() });
@@ -31,6 +56,7 @@ function observeErrors(page, device) {
     if (response.url().startsWith(origin) && response.status() >= 400) report.errors.push({ device, type: 'http', status: response.status(), url: response.url() });
   });
   page.on('requestfailed', (request) => {
+    requestEnded(request, true);
     const message = request.failure()?.errorText || 'Request failed';
     if (request.url().startsWith(origin) && !message.includes('ERR_ABORTED')) report.errors.push({ device, type: 'request', message, url: request.url() });
   });
@@ -52,14 +78,14 @@ async function waitForServer() {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     if (serverError) throw serverError;
-    if (server.exitCode !== null) throw new Error(`Vite exited with code ${server.exitCode}:\n${serverOutput}`);
+    if (server.exitCode !== null) throw new Error(`Vite preview exited with code ${server.exitCode}:\n${serverOutput}`);
     try {
       const response = await fetch(origin, { signal: AbortSignal.timeout(1000) });
       if (response.ok) return;
-    } catch { /* Wait for this process's Vite server to finish starting. */ }
+    } catch { /* Wait for this process's production preview to finish starting. */ }
     await delay(150);
   }
-  throw new Error(`Vite did not become ready at ${origin}:\n${serverOutput}`);
+  throw new Error(`Vite preview did not become ready at ${origin}:\n${serverOutput}`);
 }
 
 const snapshot = (page) => page.evaluate(() => window.rama.getSnapshot());
@@ -71,7 +97,28 @@ async function ready(page) {
   await page.waitForFunction(() => window.rama.getDiagnostics().drawCalls > 0 && window.rama.getDiagnostics().triangles > 0, null, { timeout: 15_000 });
   assert.equal(await page.locator('.village-marker').count(), 9, 'All nine city buildings need interactive map markers.');
   assert.equal(await page.locator('.rama-scene-fallback').count(), 0, 'The city unexpectedly entered its non-WebGL fallback.');
-  await page.evaluate(() => document.fonts.ready);
+  await page.waitForFunction(() => document.fonts.status === 'loaded', null, { timeout: 15_000 });
+}
+
+async function navigate(page, reload = false) {
+  const navigation = { device: pageObservations.get(page)?.device, kind: reload ? 'reload' : 'initial', phase: 'domcontentloaded', startedAt: new Date().toISOString() };
+  const startedAt = Date.now();
+  try {
+    const options = { waitUntil: 'domcontentloaded', timeout: 45_000 };
+    const response = reload ? await page.reload(options) : await page.goto(origin, options);
+    navigation.httpStatus = response?.status() ?? null;
+    navigation.phase = 'application-ready';
+    // Navigation completion alone is insufficient. Retain every real WebGL,
+    // rendered-geometry, nine-marker, fallback and font readiness assertion.
+    await ready(page);
+    navigation.phase = 'ready';
+  } catch (error) {
+    navigation.error = error.message;
+    throw error;
+  } finally {
+    navigation.durationMs = Date.now() - startedAt;
+    report.navigations.push(navigation);
+  }
 }
 
 async function clearToasts(page) {
@@ -158,6 +205,7 @@ async function assertFitsViewport(page, selector) {
 }
 
 async function shutdown() {
+  shuttingDown = true;
   if (browser) await browser.close().catch(() => {});
   if (server && server.exitCode === null) {
     server.kill('SIGTERM');
@@ -168,8 +216,9 @@ async function shutdown() {
 
 try {
   await mkdir(output, { recursive: true });
-  await step('Start an isolated Vite server', async () => {
-    server = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NO_COLOR: '1' } });
+  await step('Serve the production build with isolated Vite preview', async () => {
+    await access(join(root, 'dist/index.html')).catch(() => { throw new Error('Production build is missing. Run npm run build before npm run test:e2e.'); });
+    server = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), 'preview', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NO_COLOR: '1' } });
     const log = (chunk) => { serverOutput = (serverOutput + chunk.toString()).slice(-20_000); };
     server.stdout.on('data', log);
     server.stderr.on('data', log);
@@ -179,12 +228,12 @@ try {
 
   await step('Render the real 3D city on desktop', async () => {
     browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] });
+    browser.on('disconnected', () => { if (!shuttingDown) report.errors.push({ type: 'browserdisconnected', at: new Date().toISOString(), message: 'Chromium disconnected before test shutdown.' }); });
     const context = await browser.newContext({ viewport: report.viewports.desktop, deviceScaleFactor: 1, reducedMotion: 'reduce' });
     desktop = await context.newPage();
     desktop.setDefaultTimeout(15_000);
     observeErrors(desktop, 'desktop');
-    await desktop.goto(origin, { waitUntil: 'networkidle' });
-    await ready(desktop);
+    await navigate(desktop);
     report.desktopDiagnostics = await desktop.evaluate(() => window.rama.getDiagnostics());
     await capture(desktop, 'desktop-city.png');
   });
@@ -253,8 +302,7 @@ try {
 
   await step('Reload preserves buildings, troops, hero and claimed missions', async () => {
     const before = await snapshot(desktop);
-    await desktop.reload({ waitUntil: 'networkidle' });
-    await ready(desktop);
+    await navigate(desktop, true);
     const after = await snapshot(desktop);
     for (const key of ['buildings', 'army', 'hero', 'completedNodes', 'quests']) assert.deepEqual(after[key], before[key], `Reload did not preserve ${key}.`);
     report.persistedProgress = { buildings: after.buildings, army: after.army, hero: after.hero, completedNodes: after.completedNodes, claimedQuests: after.quests.claimed };
@@ -317,8 +365,7 @@ try {
     mobile = await context.newPage();
     mobile.setDefaultTimeout(15_000);
     observeErrors(mobile, 'mobile');
-    await mobile.goto(origin, { waitUntil: 'networkidle' });
-    await ready(mobile);
+    await navigate(mobile);
     report.mobileDiagnostics = await mobile.evaluate(() => window.rama.getDiagnostics());
     assert(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'The mobile page must not scroll horizontally.');
     await capture(mobile, 'mobile-city.png');
@@ -350,13 +397,20 @@ try {
   console.log(`\nRAMA browser smoke passed (${report.steps.length} steps). Evidence: test-results/smoke-report.json`);
 } catch (error) {
   report.status = 'failed';
-  report.failure = { message: error.message, stack: error.stack };
+  report.failure = { message: error.message, stack: error.stack, browserConnected: browser?.isConnected() ?? false, serverOutput };
+  report.failure.pages = [...pageObservations].map(([page, observation]) => ({ device: observation.device, closed: page.isClosed(), url: page.url(), recent: observation.recent, pending: [...observation.pending.values()].map(({ startedAt, ...request }) => ({ ...request, ageMs: Date.now() - startedAt })) }));
   const page = mobile && !mobile.isClosed() ? mobile : desktop && !desktop.isClosed() ? desktop : null;
   if (page) {
     await page.screenshot({ path: join(output, 'failure.png'), fullPage: false, timeout: 15_000 }).catch(() => {});
-    report.failure.diagnostics = await page.evaluate(() => window.rama?.getDiagnostics()).catch(() => null);
+    let diagnosticTimer;
+    const runtime = await Promise.race([
+      page.evaluate(() => ({ readyState: document.readyState, hasRama: Boolean(window.rama), appChildren: document.querySelector('#app')?.childElementCount ?? 0, renderer: window.rama?.getDiagnostics() ?? null })).catch(() => null),
+      new Promise((resolve) => { diagnosticTimer = setTimeout(() => resolve(null), 3000); }),
+    ]);
+    clearTimeout(diagnosticTimer);
+    report.failure.runtime = runtime;
+    report.failure.diagnostics = runtime?.renderer ?? null;
   }
-  if (!browser) report.failure.serverOutput = serverOutput;
   console.error(`\nRAMA browser smoke failed: ${error.message}`);
   process.exitCode = 1;
 } finally {

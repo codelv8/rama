@@ -124,6 +124,7 @@ Workflow นี้มีเฉพาะ `workflow_dispatch`; การ push โ�
 
 ```bash
 npx playwright install chromium
+npm run build
 npm run test:e2e
 ```
 

@@ -4,16 +4,24 @@ Run the real browser integration check after the engine tests and production bui
 
 ```sh
 npm ci
+npm run build
 npx playwright install --with-deps chromium
 node scripts/smoke.mjs
 ```
 
 Recommended package script: `"test:e2e": "node scripts/smoke.mjs"`.
 
-The script starts its own Vite process on `127.0.0.1:4178` with `--strictPort` and
-stops it when the run ends. Use `RAMA_SMOKE_PORT` to choose another unused port.
+The script requires a current production build in `dist/`. It starts its own
+**Vite preview** process on `127.0.0.1:4178` with `--strictPort` and stops it when
+the run ends. It tests built assets without the development server or HMR.
+Use `RAMA_SMOKE_PORT` to choose another unused port.
 `CHROMIUM_PATH` may point to an existing Chromium executable; otherwise Playwright
 uses its installed Chromium. Software WebGL is enabled for headless CI.
+
+Initial loads and the persistence reload wait for `DOMContentLoaded` with an
+explicit 45-second navigation timeout, then require the actual application to be
+ready: working WebGL, rendered geometry, nine interactive markers, no fallback,
+and loaded fonts. The smoke does not use `networkidle` as a readiness proxy.
 
 ## What a passing result proves
 
@@ -64,8 +72,11 @@ reduced-motion preference.
 ## Evidence and limitations
 
 `test-results/` is ignored by Git. Each run writes `smoke-report.json` with step
-results, queue timings, screenshot attempts, viewport sizes, render diagnostics
-and error details. It also captures
+results, navigation phases, queue timings, screenshot attempts, viewport sizes,
+render diagnostics and error details. On failure it retains recent request and
+navigation lifecycle events, pending asset requests, page-crash/browser-disconnect
+events, and a bounded runtime probe to distinguish a navigation stall from an
+application initialization failure. It also captures
 desktop city, world, heroes, night, mobile city and mobile dialog screenshots.
 The backup round trip also retains the real downloaded `exported-backup.json`.
 Failures after browser startup additionally capture `failure.png`.
