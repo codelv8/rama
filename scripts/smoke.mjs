@@ -1,0 +1,305 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+import { chromium } from 'playwright';
+
+// Browser integration smoke test. Gameplay changes happen only through the UI.
+// window.rama supplies read-only assertions; no engine functions or saves are edited.
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const output = join(root, 'test-results');
+const port = Number(process.env.RAMA_SMOKE_PORT || 4178);
+assert(Number.isInteger(port) && port >= 1024 && port <= 65535, 'RAMA_SMOKE_PORT must be an integer from 1024 to 65535.');
+const origin = `http://127.0.0.1:${port}`;
+const report = { status: 'running', startedAt: new Date().toISOString(), viewports: { desktop: { width: 1440, height: 1000 }, mobile: { width: 390, height: 844 } }, steps: [], screenshots: [], errors: [] };
+let browser;
+let server;
+let desktop;
+let mobile;
+let serverOutput = '';
+let serverError;
+
+function observeErrors(page, device) {
+  page.on('pageerror', (error) => report.errors.push({ device, type: 'pageerror', message: error.message }));
+  page.on('console', (message) => {
+    if (message.type() === 'error') report.errors.push({ device, type: 'console', message: message.text() });
+  });
+  page.on('response', (response) => {
+    if (response.url().startsWith(origin) && response.status() >= 400) report.errors.push({ device, type: 'http', status: response.status(), url: response.url() });
+  });
+  page.on('requestfailed', (request) => {
+    const message = request.failure()?.errorText || 'Request failed';
+    if (request.url().startsWith(origin) && !message.includes('ERR_ABORTED')) report.errors.push({ device, type: 'request', message, url: request.url() });
+  });
+}
+
+async function step(name, operation) {
+  const startedAt = Date.now();
+  try {
+    await operation();
+    report.steps.push({ name, status: 'passed', durationMs: Date.now() - startedAt });
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    report.steps.push({ name, status: 'failed', durationMs: Date.now() - startedAt, message: error.message });
+    throw error;
+  }
+}
+
+async function waitForServer() {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (serverError) throw serverError;
+    if (server.exitCode !== null) throw new Error(`Vite exited with code ${server.exitCode}:\n${serverOutput}`);
+    try {
+      const response = await fetch(origin, { signal: AbortSignal.timeout(1000) });
+      if (response.ok) return;
+    } catch { /* Wait for this process's Vite server to finish starting. */ }
+    await delay(150);
+  }
+  throw new Error(`Vite did not become ready at ${origin}:\n${serverOutput}`);
+}
+
+const snapshot = (page) => page.evaluate(() => window.rama.getSnapshot());
+
+async function ready(page) {
+  await page.waitForFunction(() => Boolean(window.rama?.getDiagnostics()), null, { timeout: 30_000 });
+  const diagnostics = await page.evaluate(() => window.rama.getDiagnostics());
+  assert.equal(diagnostics.webgl, true, 'The smoke run requires working WebGL; the accessible fallback is not a 3D pass.');
+  await page.waitForFunction(() => window.rama.getDiagnostics().drawCalls > 0 && window.rama.getDiagnostics().triangles > 0, null, { timeout: 15_000 });
+  assert.equal(await page.locator('.village-marker').count(), 9, 'All nine city buildings need interactive map markers.');
+  assert.equal(await page.locator('.rama-scene-fallback').count(), 0, 'The city unexpectedly entered its non-WebGL fallback.');
+  await page.evaluate(() => document.fonts.ready);
+}
+
+async function clearToasts(page) {
+  // Native dialogs make the rest of the document inert. Never force a click
+  // through that accessibility boundary merely to tidy a screenshot.
+  if (await page.locator('#game-dialog').evaluate((element) => element.open)) return;
+  const closeButtons = page.locator('#toasts button');
+  while (await closeButtons.count()) await closeButtons.first().click();
+}
+
+async function capture(page, filename) {
+  await clearToasts(page);
+  await page.screenshot({ path: join(output, filename), fullPage: true, animations: 'disabled' });
+  report.screenshots.push(filename);
+}
+
+async function advanceQueue(page, queueName) {
+  const before = await snapshot(page);
+  const queue = before.queues[queueName];
+  assert(queue, `${queueName} queue was not created by the UI.`);
+  const remaining = await page.evaluate((endsAt) => Math.max(0, endsAt - Date.now()), queue.endsAt);
+  // The real application timer calls tick after browser time advances. No state
+  // mutations, engine calls, or fixture saves are used to complete the action.
+  await page.clock.fastForward(remaining + 1100);
+  await page.waitForFunction((name) => window.rama.getSnapshot().queues[name] === null, queueName, { timeout: 10_000 });
+}
+
+async function closeDialog(page) {
+  await page.locator('#game-dialog [data-action="close"]').click();
+  await page.waitForFunction(() => !document.querySelector('#game-dialog').open);
+}
+
+async function claimQuest(page, id) {
+  await page.locator(`.main-nav [data-tab="quests"]`).click();
+  const button = page.locator(`#screen-panel [data-action="claim"][data-id="${id}"]`);
+  assert(await button.isEnabled(), `${id} should be claimable after completing its real prerequisite actions.`);
+  const before = await snapshot(page);
+  await button.click();
+  const after = await snapshot(page);
+  assert(after.quests.claimed.includes(id), `${id} was not recorded as claimed.`);
+  assert(after.resources.wood > before.resources.wood, 'Claiming a quest must grant its resource reward.');
+  assert.equal(after.quests.claimed.length, before.quests.claimed.length + 1, 'A claim should add exactly one completion.');
+}
+
+async function train(page, id, count) {
+  await page.locator('.main-nav [data-tab="army"]').click();
+  const before = await snapshot(page);
+  await page.locator(`#screen-panel [data-action="train"][data-id="${id}"]`).click();
+  await page.locator('#troop-count').fill(String(count));
+  await page.locator('#train-confirm').click();
+  const queued = await snapshot(page);
+  assert.equal(queued.queues.training?.count, count);
+  assert.equal(queued.army[id], before.army[id], 'Soldiers must not be granted before training finishes.');
+  assert(queued.resources.rice < before.resources.rice, 'Training should consume resources.');
+  await advanceQueue(page, 'training');
+  assert.equal((await snapshot(page)).army[id], before.army[id] + count, 'Trained soldiers were not added after the timer.');
+}
+
+async function assertFitsViewport(page, selector) {
+  const bounds = await page.locator(selector).evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: window.innerWidth, height: window.innerHeight, scrollWidth: element.scrollWidth, clientWidth: element.clientWidth };
+  });
+  assert(bounds.left >= -1 && bounds.right <= bounds.width + 1, `${selector} extends beyond the horizontal viewport: ${JSON.stringify(bounds)}`);
+  assert(bounds.top >= -1 && bounds.bottom <= bounds.height + 1, `${selector} extends beyond the vertical viewport: ${JSON.stringify(bounds)}`);
+  assert(bounds.scrollWidth <= bounds.clientWidth + 2, `${selector} has unintended horizontal overflow: ${JSON.stringify(bounds)}`);
+}
+
+async function shutdown() {
+  if (browser) await browser.close().catch(() => {});
+  if (server && server.exitCode === null) {
+    server.kill('SIGTERM');
+    const stopped = await Promise.race([new Promise((resolve) => server.once('exit', () => resolve(true))), delay(5000).then(() => false)]);
+    if (!stopped) server.kill('SIGKILL');
+  }
+}
+
+try {
+  await mkdir(output, { recursive: true });
+  await step('Start an isolated Vite server', async () => {
+    server = spawn(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', String(port), '--strictPort'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NO_COLOR: '1' } });
+    const log = (chunk) => { serverOutput = (serverOutput + chunk.toString()).slice(-20_000); };
+    server.stdout.on('data', log);
+    server.stderr.on('data', log);
+    server.on('error', (error) => { serverError = error; });
+    await waitForServer();
+  });
+
+  await step('Render the real 3D city on desktop', async () => {
+    browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] });
+    const context = await browser.newContext({ viewport: report.viewports.desktop, deviceScaleFactor: 1, reducedMotion: 'reduce' });
+    desktop = await context.newPage();
+    desktop.setDefaultTimeout(15_000);
+    observeErrors(desktop, 'desktop');
+    await desktop.clock.install({ time: new Date() });
+    await desktop.goto(origin, { waitUntil: 'networkidle' });
+    await ready(desktop);
+    report.desktopDiagnostics = await desktop.evaluate(() => window.rama.getDiagnostics());
+    await capture(desktop, 'desktop-city.png');
+  });
+
+  await step('Upgrade the sawmill by selecting its city marker', async () => {
+    const before = await snapshot(desktop);
+    await desktop.locator('.village-marker[data-building="sawmill"]').click();
+    assert.equal(await desktop.locator('#modal-title').textContent(), 'โรงเลื่อย');
+    await desktop.locator('[data-action="upgrade"][data-id="sawmill"]').click();
+    const queued = await snapshot(desktop);
+    assert.equal(queued.queues.building?.buildingId, 'sawmill');
+    assert.equal(queued.buildings.sawmill, before.buildings.sawmill, 'The upgrade must wait for its construction timer.');
+    assert(queued.resources.wood < before.resources.wood, 'An upgrade should consume resources.');
+    await advanceQueue(desktop, 'building');
+    assert.equal((await snapshot(desktop)).buildings.sawmill, before.buildings.sawmill + 1);
+    await desktop.keyboard.press('Escape');
+    assert.equal(await desktop.locator('#game-dialog').evaluate((element) => element.open), false);
+    assert(await desktop.locator('.village-marker[data-building="sawmill"]').evaluate((element) => document.activeElement === element), 'Closing the dialog should restore keyboard focus to its trigger.');
+  });
+
+  await step('Claim the construction quest through the missions screen', () => claimQuest(desktop, 'foundation'));
+  await step('Train three guardians using the amount input and training timer', () => train(desktop, 'guardian', 3));
+  await step('Train three archers to complete the recruitment mission', () => train(desktop, 'archer', 3));
+  await step('Claim the recruitment quest', () => claimQuest(desktop, 'recruit'));
+
+  await step('Allocate a hero ability point', async () => {
+    await desktop.locator('.main-nav [data-tab="heroes"]').click();
+    await capture(desktop, 'desktop-heroes.png');
+    const before = await snapshot(desktop);
+    await desktop.locator('#screen-panel [data-action="hero"][data-id="rama"]').click();
+    await desktop.locator('[data-action="allocate"][data-id="attack"]').click();
+    const after = await snapshot(desktop);
+    assert.equal(after.hero.attack, before.hero.attack + 1);
+    assert.equal(after.hero.points, before.hero.points - 1);
+    await closeDialog(desktop);
+  });
+
+  await step('Send the army to the grove and resolve a real expedition', async () => {
+    await desktop.locator('.main-nav [data-tab="world"]').click();
+    assert.equal(await desktop.locator('.world-node').count(), 6);
+    await capture(desktop, 'desktop-world.png');
+    const before = await snapshot(desktop);
+    await desktop.locator('.world-node[data-node-id="grove"]').click();
+    assert.equal(await desktop.locator('#modal-title').textContent(), 'ป่าหิมพานต์');
+    assert(await desktop.locator('#expedition-confirm').isEnabled());
+    await desktop.locator('#expedition-confirm').click();
+    const queued = await snapshot(desktop);
+    assert.equal(queued.queues.expedition?.nodeId, 'grove');
+    assert(Object.values(queued.army).reduce((sum, count) => sum + count, 0) < Object.values(before.army).reduce((sum, count) => sum + count, 0), 'Deployed troops must leave the available army.');
+    await desktop.waitForSelector('.world-march-marker');
+    await advanceQueue(desktop, 'expedition');
+    const after = await snapshot(desktop);
+    assert(after.completedNodes.includes('grove'), 'Winning the grove must complete the destination.');
+    assert.equal(after.stats.victories, before.stats.victories + 1);
+    assert(Object.values(after.army).reduce((sum, count) => sum + count, 0) > 0, 'Survivors must return after a victory.');
+    assert(after.resources.wood > queued.resources.wood, 'A victorious expedition must return loot.');
+    assert(after.events.some((event) => event.kind === 'victory'), 'The result needs a persistent battle report.');
+  });
+
+  await step('Claim the victory quest and inspect the report', async () => {
+    await claimQuest(desktop, 'first-victory');
+    await desktop.locator('.statusbar [data-action="reports"]').click();
+    assert((await desktop.locator('.report-entry.victory, .report-entry .report-symbol.victory').count()) > 0, 'The report dialog must show the expedition victory.');
+    await closeDialog(desktop);
+  });
+
+  await step('Reload preserves buildings, troops, hero and claimed missions', async () => {
+    const before = await snapshot(desktop);
+    await desktop.reload({ waitUntil: 'networkidle' });
+    await ready(desktop);
+    const after = await snapshot(desktop);
+    for (const key of ['buildings', 'army', 'hero', 'completedNodes', 'quests']) assert.deepEqual(after[key], before[key], `Reload did not preserve ${key}.`);
+    report.persistedProgress = { buildings: after.buildings, army: after.army, hero: after.hero, completedNodes: after.completedNodes, claimedQuests: after.quests.claimed };
+  });
+
+  await step('Day and night update both the interface and the 3D scene', async () => {
+    await desktop.locator('.weather-button').click();
+    assert(await desktop.locator('body').evaluate((element) => element.classList.contains('night-mode')));
+    assert.equal(await desktop.evaluate(() => window.rama.getDiagnostics().night), true);
+    await capture(desktop, 'desktop-night.png');
+    await desktop.locator('.weather-button').click();
+    assert.equal(await desktop.evaluate(() => window.rama.getDiagnostics().night), false);
+  });
+
+  await step('Render the saved city at 390 × 844 with touch controls', async () => {
+    const storageState = await desktop.context().storageState();
+    const progress = await snapshot(desktop);
+    const context = await browser.newContext({ viewport: report.viewports.mobile, deviceScaleFactor: 1, isMobile: true, hasTouch: true, reducedMotion: 'reduce', storageState });
+    mobile = await context.newPage();
+    mobile.setDefaultTimeout(15_000);
+    observeErrors(mobile, 'mobile');
+    await mobile.clock.install({ time: new Date(progress.lastTick) });
+    await mobile.goto(origin, { waitUntil: 'networkidle' });
+    await ready(mobile);
+    report.mobileDiagnostics = await mobile.evaluate(() => window.rama.getDiagnostics());
+    assert(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'The mobile page must not scroll horizontally.');
+    await capture(mobile, 'mobile-city.png');
+  });
+
+  await step('Mobile building and expedition dialogs fit the viewport', async () => {
+    await mobile.locator('.building-card[data-id="sawmill"]').tap();
+    await assertFitsViewport(mobile, '#game-dialog');
+    await capture(mobile, 'mobile-building-dialog.png');
+    await closeDialog(mobile);
+    await mobile.locator('.main-nav [data-tab="world"]').tap();
+    await mobile.locator('[data-action="recenter"]').tap();
+    await mobile.locator('.world-node[data-node-id="grove"]').tap();
+    await assertFitsViewport(mobile, '#game-dialog');
+    await capture(mobile, 'mobile-expedition-dialog.png');
+    await closeDialog(mobile);
+  });
+
+  await step('No uncaught page errors or failed application assets', async () => {
+    assert.deepEqual(report.errors, [], JSON.stringify(report.errors, null, 2));
+  });
+
+  report.status = 'passed';
+  console.log(`\nRAMA browser smoke passed (${report.steps.length} steps). Evidence: test-results/smoke-report.json`);
+} catch (error) {
+  report.status = 'failed';
+  report.failure = { message: error.message, stack: error.stack };
+  const page = mobile && !mobile.isClosed() ? mobile : desktop && !desktop.isClosed() ? desktop : null;
+  if (page) {
+    await page.screenshot({ path: join(output, 'failure.png'), fullPage: true, animations: 'disabled' }).catch(() => {});
+    report.failure.diagnostics = await page.evaluate(() => window.rama?.getDiagnostics()).catch(() => null);
+  }
+  if (!browser) report.failure.serverOutput = serverOutput;
+  console.error(`\nRAMA browser smoke failed: ${error.message}`);
+  process.exitCode = 1;
+} finally {
+  report.finishedAt = new Date().toISOString();
+  await mkdir(output, { recursive: true });
+  await writeFile(join(output, 'smoke-report.json'), `${JSON.stringify(report, null, 2)}\n`);
+  await shutdown();
+}
